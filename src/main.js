@@ -104,36 +104,41 @@ function getAuthToken(cfg) {
   return crypto.createHash('sha256').update(`${name}:${secret}:erii-power-v1`).digest('hex');
 }
 
-// Get physical NIC MAC addresses & broadcast addresses for WOL
+// Get physical NIC MAC addresses & per-interface IPv4/broadcast pairs for reliable WOL on Windows
 function getLocalNetworkMeta() {
   const ifaces = os.networkInterfaces();
-  const macs = [];
-  const broadcasts = new Set(['255.255.255.255']);
+  const ethernetMacs = [];
+  const otherMacs = [];
+  const sendTargets = []; // { localIp, broadcast }
   for (const [name, entries] of Object.entries(ifaces)) {
     const low = name.toLowerCase();
-    // Skip virtual/loopback/EasyTier TUN adapters when picking primary physical MAC
     const isVirtual = low.includes('vethernet') || low.includes('virtual') || low.includes('vmware') ||
       low.includes('vbox') || low.startsWith('et_') || low.includes('wintun') || low.includes('tailscale') ||
-      low.includes('loopback') || low.includes('bluetooth');
+      low.includes('loopback') || low.includes('bluetooth') || low.includes('zerotier') || low.includes('radmin');
+    const isEthernet = low.includes('ethernet') || low.includes('以太网') || low.includes('本地连接') || low.startsWith('eth') || low.startsWith('enp');
     for (const info of (entries || [])) {
-      if (info.family === 'IPv4' && !info.internal) {
-        if (info.mac && info.mac !== '00:00:00:00:00:00' && !isVirtual) {
+      if (info.family === 'IPv4' && !info.internal && !isVirtual) {
+        if (info.mac && info.mac !== '00:00:00:00:00:00') {
           const formatted = info.mac.toUpperCase();
-          if (!macs.includes(formatted)) macs.push(formatted);
+          if (isEthernet) {
+            if (!ethernetMacs.includes(formatted)) ethernetMacs.push(formatted);
+          } else {
+            if (!otherMacs.includes(formatted)) otherMacs.push(formatted);
+          }
         }
-        // Calculate directed broadcast address for subnet
-        if (info.address && info.netmask && !isVirtual) {
+        if (info.address && info.netmask) {
           const ipParts = info.address.split('.').map(Number);
           const maskParts = info.netmask.split('.').map(Number);
           if (ipParts.length === 4 && maskParts.length === 4) {
             const bcast = ipParts.map((p, i) => (p | (~maskParts[i] & 255))).join('.');
-            broadcasts.add(bcast);
+            sendTargets.push({ localIp: info.address, broadcast: bcast });
           }
         }
       }
     }
   }
-  return { primaryMac: macs[0] || '', macs, broadcasts: Array.from(broadcasts) };
+  const macs = [...ethernetMacs, ...otherMacs];
+  return { primaryMac: macs[0] || '', macs, sendTargets };
 }
 
 function normalizeMac(mac) {
@@ -142,37 +147,54 @@ function normalizeMac(mac) {
   return hex.match(/.{2}/g).join(':');
 }
 
-function sendMagicPacketLocal(macStr) {
+function sendPacketFromInterface(packet, localIp, targets) {
   return new Promise((resolve) => {
-    const clean = normalizeMac(macStr);
-    if (!clean) return resolve({ ok: false, error: '无效的 MAC 地址' });
-    const macBytes = Buffer.from(clean.replace(/:/g, ''), 'hex');
-    const packet = Buffer.alloc(6 + 16 * 6, 0xff);
-    for (let i = 0; i < 16; i++) {
-      macBytes.copy(packet, 6 + i * 6);
-    }
-    const { broadcasts } = getLocalNetworkMeta();
     const sock = dgram.createSocket('udp4');
-    sock.bind(() => {
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      try { sock.close(); } catch {}
+      resolve(ok);
+    };
+    sock.on('error', () => finish(false));
+    const bindArgs = localIp ? [0, localIp] : [0];
+    sock.bind(...bindArgs, () => {
       try { sock.setBroadcast(true); } catch {}
-      let pending = broadcasts.length * 2;
+      let pending = targets.length * 2;
       const done = () => {
         pending -= 1;
-        if (pending <= 0) {
-          try { sock.close(); } catch {}
-          resolve({ ok: true, mac: clean, targets: broadcasts });
-        }
+        if (pending <= 0) finish(true);
       };
-      for (const addr of broadcasts) {
+      for (const addr of targets) {
         sock.send(packet, 0, packet.length, 9, addr, done);
         sock.send(packet, 0, packet.length, 7, addr, done);
       }
     });
-    sock.on('error', (err) => {
-      try { sock.close(); } catch {}
-      resolve({ ok: false, error: String(err.message || err) });
-    });
+    setTimeout(() => finish(true), 1500);
   });
+}
+
+async function sendMagicPacketLocal(macStr) {
+  const clean = normalizeMac(macStr);
+  if (!clean) return { ok: false, error: '无效的 MAC 地址' };
+  const macBytes = Buffer.from(clean.replace(/:/g, ''), 'hex');
+  const packet = Buffer.alloc(6 + 16 * 6, 0xff);
+  for (let i = 0; i < 16; i++) {
+    macBytes.copy(packet, 6 + i * 6);
+  }
+  const { sendTargets } = getLocalNetworkMeta();
+  const tasks = [];
+  // Explicitly bind to every physical NIC's IPv4 so Windows never routes WOL only to the virtual EasyTier NIC
+  for (const t of sendTargets) {
+    const addrs = t.broadcast === '255.255.255.255' ? ['255.255.255.255'] : [t.broadcast, '255.255.255.255'];
+    tasks.push(sendPacketFromInterface(packet, t.localIp, addrs));
+  }
+  if (tasks.length === 0) {
+    tasks.push(sendPacketFromInterface(packet, null, ['255.255.255.255']));
+  }
+  const results = await Promise.all(tasks);
+  return { ok: results.some(Boolean), mac: clean, nicCount: tasks.length };
 }
 
 function httpJsonRequest(ip, method, reqPath, bodyObj, token, timeoutMs = 3000) {
