@@ -2,11 +2,17 @@ const { app, BrowserWindow, ipcMain, Tray, Menu, shell, nativeImage } = require(
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const http = require('http');
+const dgram = require('dgram');
+const crypto = require('crypto');
 const { spawn, execFile } = require('child_process');
+
+const CONTROL_PORT = 17988;
 
 let mainWindow = null;
 let tray = null;
 let easytierProc = null;
+let controlServer = null;
 let isQuitting = false;
 let engineMode = 'stopped'; // 'builtin' | 'external' | 'unconfigured' | 'stopped' | 'error'
 let engineLastError = '';
@@ -48,7 +54,8 @@ function loadDefaultConfig() {
       use_dhcp: true,
       static_ip: '',
       nas_http_port: 5666,
-      nas_https_port: 5667
+      nas_https_port: 5667,
+      allow_remote_power: true
     };
   }
 }
@@ -60,7 +67,8 @@ function loadAppData() {
     config: {
       ...defCfg,
       hostname: os.hostname(),
-      autoStart: false
+      autoStart: false,
+      allow_remote_power: true
     },
     aliases: {},
     favorites: [],
@@ -87,6 +95,193 @@ function saveAppData(data) {
   const filePath = getDataFilePath();
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+}
+
+function getAuthToken(cfg) {
+  const name = (cfg && cfg.network_name ? cfg.network_name : '').trim();
+  const secret = (cfg && cfg.network_secret ? cfg.network_secret : '').trim();
+  if (!name || !secret) return '';
+  return crypto.createHash('sha256').update(`${name}:${secret}:erii-power-v1`).digest('hex');
+}
+
+// Get physical NIC MAC addresses & broadcast addresses for WOL
+function getLocalNetworkMeta() {
+  const ifaces = os.networkInterfaces();
+  const macs = [];
+  const broadcasts = new Set(['255.255.255.255']);
+  for (const [name, entries] of Object.entries(ifaces)) {
+    const low = name.toLowerCase();
+    // Skip virtual/loopback/EasyTier TUN adapters when picking primary physical MAC
+    const isVirtual = low.includes('vethernet') || low.includes('virtual') || low.includes('vmware') ||
+      low.includes('vbox') || low.startsWith('et_') || low.includes('wintun') || low.includes('tailscale') ||
+      low.includes('loopback') || low.includes('bluetooth');
+    for (const info of (entries || [])) {
+      if (info.family === 'IPv4' && !info.internal) {
+        if (info.mac && info.mac !== '00:00:00:00:00:00' && !isVirtual) {
+          const formatted = info.mac.toUpperCase();
+          if (!macs.includes(formatted)) macs.push(formatted);
+        }
+        // Calculate directed broadcast address for subnet
+        if (info.address && info.netmask && !isVirtual) {
+          const ipParts = info.address.split('.').map(Number);
+          const maskParts = info.netmask.split('.').map(Number);
+          if (ipParts.length === 4 && maskParts.length === 4) {
+            const bcast = ipParts.map((p, i) => (p | (~maskParts[i] & 255))).join('.');
+            broadcasts.add(bcast);
+          }
+        }
+      }
+    }
+  }
+  return { primaryMac: macs[0] || '', macs, broadcasts: Array.from(broadcasts) };
+}
+
+function normalizeMac(mac) {
+  const hex = String(mac || '').replace(/[^0-9a-fA-F]/g, '').toUpperCase();
+  if (hex.length !== 12) return '';
+  return hex.match(/.{2}/g).join(':');
+}
+
+function sendMagicPacketLocal(macStr) {
+  return new Promise((resolve) => {
+    const clean = normalizeMac(macStr);
+    if (!clean) return resolve({ ok: false, error: '无效的 MAC 地址' });
+    const macBytes = Buffer.from(clean.replace(/:/g, ''), 'hex');
+    const packet = Buffer.alloc(6 + 16 * 6, 0xff);
+    for (let i = 0; i < 16; i++) {
+      macBytes.copy(packet, 6 + i * 6);
+    }
+    const { broadcasts } = getLocalNetworkMeta();
+    const sock = dgram.createSocket('udp4');
+    sock.bind(() => {
+      try { sock.setBroadcast(true); } catch {}
+      let pending = broadcasts.length * 2;
+      const done = () => {
+        pending -= 1;
+        if (pending <= 0) {
+          try { sock.close(); } catch {}
+          resolve({ ok: true, mac: clean, targets: broadcasts });
+        }
+      };
+      for (const addr of broadcasts) {
+        sock.send(packet, 0, packet.length, 9, addr, done);
+        sock.send(packet, 0, packet.length, 7, addr, done);
+      }
+    });
+    sock.on('error', (err) => {
+      try { sock.close(); } catch {}
+      resolve({ ok: false, error: String(err.message || err) });
+    });
+  });
+}
+
+function httpJsonRequest(ip, method, reqPath, bodyObj, token, timeoutMs = 3000) {
+  return new Promise((resolve) => {
+    const payload = bodyObj ? JSON.stringify(bodyObj) : '';
+    const req = http.request({
+      hostname: ip,
+      port: CONTROL_PORT,
+      path: reqPath,
+      method,
+      timeout: timeoutMs,
+      headers: {
+        'X-Erii-Token': token || '',
+        ...(payload ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) } : {})
+      }
+    }, (res) => {
+      let raw = '';
+      res.on('data', (c) => { raw += c; });
+      res.on('end', () => {
+        try {
+          resolve({ status: res.statusCode, data: JSON.parse(raw || '{}') });
+        } catch {
+          resolve({ status: res.statusCode, data: {} });
+        }
+      });
+    });
+    req.on('timeout', () => { req.destroy(); resolve({ status: 0, error: 'timeout' }); });
+    req.on('error', (e) => resolve({ status: 0, error: String(e.message || e) }));
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+function startControlServer() {
+  if (controlServer) return;
+  controlServer = http.createServer((req, res) => {
+    const sendJson = (status, obj) => {
+      const buf = Buffer.from(JSON.stringify(obj), 'utf-8');
+      res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': buf.length });
+      res.end(buf);
+    };
+
+    const data = loadAppData();
+    const expectedToken = getAuthToken(data.config);
+    const gotToken = String(req.headers['x-erii-token'] || '');
+    if (!expectedToken || gotToken !== expectedToken) {
+      return sendJson(401, { ok: false, error: 'unauthorized' });
+    }
+
+    if (req.method === 'GET' && req.url === '/api/info') {
+      const meta = getLocalNetworkMeta();
+      return sendJson(200, {
+        ok: true,
+        hostname: data.config.hostname || os.hostname(),
+        mac: meta.primaryMac,
+        macs: meta.macs,
+        allow_remote_power: data.config.allow_remote_power !== false
+      });
+    }
+
+    if (req.method === 'POST' && (req.url === '/api/power' || req.url === '/api/wol')) {
+      let raw = '';
+      req.on('data', (chunk) => { if (raw.length < 16384) raw += chunk; });
+      req.on('end', async () => {
+        let body = {};
+        try { body = JSON.parse(raw || '{}'); } catch {}
+
+        if (req.url === '/api/wol') {
+          const wolRes = await sendMagicPacketLocal(body.mac);
+          return sendJson(wolRes.ok ? 200 : 400, wolRes);
+        }
+
+        if (data.config.allow_remote_power === false) {
+          return sendJson(403, { ok: false, error: '目标设备已在设置中关闭「允许远程电源控制」' });
+        }
+
+        const action = body.action;
+        if (action === 'shutdown') {
+          spawn('shutdown.exe', ['/s', '/t', '5', '/c', 'Erii远程：正在执行远程关机（5秒后关闭）'], { windowsHide: true }).unref();
+          return sendJson(200, { ok: true, message: '已下发关机指令（目标电脑 5 秒后关机）' });
+        }
+        if (action === 'reboot') {
+          spawn('shutdown.exe', ['/r', '/t', '5', '/c', 'Erii远程：正在执行远程重启（5秒后重启）'], { windowsHide: true }).unref();
+          return sendJson(200, { ok: true, message: '已下发重启指令（目标电脑 5 秒后重启）' });
+        }
+        if (action === 'cancel') {
+          spawn('shutdown.exe', ['/a'], { windowsHide: true }).unref();
+          return sendJson(200, { ok: true, message: '已取消目标电脑的计划关机/重启' });
+        }
+        if (action === 'lock') {
+          spawn('rundll32.exe', ['user32.dll,LockWorkStation'], { windowsHide: true }).unref();
+          return sendJson(200, { ok: true, message: '已锁定目标电脑屏幕' });
+        }
+        if (action === 'sleep') {
+          spawn('rundll32.exe', ['powrprof.dll,SetSuspendState', '0,1,0'], { windowsHide: true }).unref();
+          return sendJson(200, { ok: true, message: '已下发睡眠指令' });
+        }
+        return sendJson(400, { ok: false, error: '未知的电源指令' });
+      });
+      return;
+    }
+
+    sendJson(404, { ok: false, error: 'not found' });
+  });
+
+  controlServer.on('error', () => {
+    // Port may already be in use; ignore non-fatally
+  });
+  controlServer.listen(CONTROL_PORT, '0.0.0.0');
 }
 
 function checkExternalEasyTier() {
@@ -175,6 +370,28 @@ async function startEasyTierEngine(forceRestart = false) {
   }
 }
 
+// Auto-probe peer MAC address from its EriiRemote control service (non-blocking)
+const probedMacIps = new Set();
+async function probePeerMacIfNeeded(peer, data, token) {
+  if (!token || !peer.ipv4) return;
+  const key = peer.hostname || peer.ipv4;
+  const existing = data.knownDevices[key];
+  if (existing && existing.mac) return;
+  if (probedMacIps.has(peer.ipv4)) return;
+  probedMacIps.add(peer.ipv4);
+  setTimeout(() => probedMacIps.delete(peer.ipv4), 60000);
+
+  const res = await httpJsonRequest(peer.ipv4, 'GET', '/api/info', null, token, 2000);
+  if (res.status === 200 && res.data && res.data.mac) {
+    const latest = loadAppData();
+    if (!latest.knownDevices[key]) {
+      latest.knownDevices[key] = { hostname: peer.hostname, ipv4: peer.ipv4, lastSeen: Date.now() };
+    }
+    latest.knownDevices[key].mac = normalizeMac(res.data.mac);
+    saveAppData(latest);
+  }
+}
+
 function queryPeers() {
   return new Promise((resolve) => {
     if (engineMode === 'unconfigured') {
@@ -219,12 +436,14 @@ function queryPeers() {
           }
         }
         const data = loadAppData();
+        const token = getAuthToken(data.config);
         let dirty = false;
         for (const p of peers) {
           const key = p.hostname || p.ipv4;
           const existing = data.knownDevices[key];
           if (!existing || existing.ipv4 !== p.ipv4) {
             data.knownDevices[key] = {
+              ...(existing || {}),
               hostname: p.hostname,
               ipv4: p.ipv4,
               lastSeen: Date.now()
@@ -233,6 +452,7 @@ function queryPeers() {
           } else {
             data.knownDevices[key].lastSeen = Date.now();
           }
+          probePeerMacIfNeeded(p, data, token);
         }
         if (dirty) saveAppData(data);
 
@@ -307,6 +527,9 @@ function createTray() {
         if (easytierProc) {
           try { easytierProc.kill(); } catch {}
         }
+        if (controlServer) {
+          try { controlServer.close(); } catch {}
+        }
         app.quit();
       }
     }
@@ -331,6 +554,7 @@ app.on('second-instance', () => {
 app.whenReady().then(async () => {
   createWindow();
   createTray();
+  startControlServer();
   await startEasyTierEngine(false);
 });
 
@@ -338,6 +562,9 @@ app.on('before-quit', () => {
   isQuitting = true;
   if (easytierProc) {
     try { easytierProc.kill(); } catch {}
+  }
+  if (controlServer) {
+    try { controlServer.close(); } catch {}
   }
 });
 
@@ -351,7 +578,11 @@ ipcMain.on('win-maximize', () => {
 ipcMain.on('win-close', () => mainWindow && mainWindow.hide());
 
 ipcMain.handle('get-peers', () => queryPeers());
-ipcMain.handle('get-app-data', () => loadAppData());
+ipcMain.handle('get-app-data', () => {
+  const d = loadAppData();
+  d.localMac = getLocalNetworkMeta().primaryMac;
+  return d;
+});
 
 ipcMain.handle('save-config', async (_e, newCfg) => {
   const data = loadAppData();
@@ -418,6 +649,52 @@ ipcMain.handle('ping-device', (_e, ip) => {
       resolve({ ok: !err, ms: m ? Number(m[1]) : null, raw: out });
     });
   });
+});
+
+ipcMain.handle('remote-power', async (_e, { ip, action }) => {
+  const data = loadAppData();
+  const token = getAuthToken(data.config);
+  if (!token) return { ok: false, error: '请先配置局域网密钥' };
+  const res = await httpJsonRequest(ip, 'POST', '/api/power', { action }, token, 4000);
+  if (res.status === 200 && res.data && res.data.ok) {
+    return { ok: true, message: res.data.message || '指令已执行' };
+  }
+  if (res.status === 403) {
+    return { ok: false, error: res.data.error || '目标设备未开启远程电源控制' };
+  }
+  if (res.status === 401) {
+    return { ok: false, error: '密钥校验失败，请确保两端局域网密钥一致' };
+  }
+  return { ok: false, error: '无法连接目标电源服务（请确认目标电脑运行着 Erii 远程 v1.1+ 且放行 17988 端口）' };
+});
+
+ipcMain.handle('wake-device', async (_e, { mac, onlinePeerIps }) => {
+  const clean = normalizeMac(mac);
+  if (!clean) return { ok: false, error: 'MAC 地址格式无效（示例：AA:BB:CC:DD:EE:FF）' };
+  const data = loadAppData();
+  const token = getAuthToken(data.config);
+
+  // 1. Broadcast locally
+  const localRes = await sendMagicPacketLocal(clean);
+
+  // 2. Ask all currently online peers running EriiRemote to relay WOL on their physical LANs
+  let relaySuccess = 0;
+  const ips = Array.isArray(onlinePeerIps) ? onlinePeerIps : [];
+  if (token && ips.length > 0) {
+    const results = await Promise.all(
+      ips.map((ip) => httpJsonRequest(ip, 'POST', '/api/wol', { mac: clean }, token, 2500))
+    );
+    relaySuccess = results.filter((r) => r.status === 200 && r.data && r.data.ok).length;
+  }
+
+  return {
+    ok: localRes.ok || relaySuccess > 0,
+    mac: clean,
+    relaySuccess,
+    message: relaySuccess > 0
+      ? `已发送唤醒包至 ${clean}（本机 + ${relaySuccess} 台在线节点协同广播）`
+      : `已在本机局域网发送唤醒包至 ${clean}`
+  };
 });
 
 ipcMain.handle('restart-engine', () => startEasyTierEngine(true));

@@ -218,7 +218,23 @@ html, body {
   justify-content: center;
   cursor: pointer;
 }
-.hero-banner.offline { cursor: not-allowed; filter: grayscale(0.85); opacity: 0.72; }
+.hero-banner.offline { cursor: pointer; filter: grayscale(0.45); opacity: 0.88; }
+.hero-banner.offline .hero-orb {
+  background: radial-gradient(circle at 38% 35%, #f59e0b 0%, #ea580c 36%, #1e293b 72%, rgba(4,7,13,0) 78%);
+}
+.power-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px;
+}
+.power-btn {
+  padding: 12px 10px; border-radius: 10px; border: 1px solid var(--border);
+  background: #f8fafc; color: var(--text-main); font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: .15s; text-align: center;
+}
+.power-btn:hover { background: #eff6ff; border-color: #93c5fd; color: var(--primary); }
+.power-btn.danger { background: #fef2f2; border-color: #fecaca; color: #dc2626; }
+.power-btn.danger:hover { background: #fee2e2; border-color: #f87171; }
+.power-btn.wake { background: #ecfdf5; border-color: #a7f3d0; color: #059669; grid-column: 1 / -1; }
+.power-btn.wake:hover { background: #d1fae5; }
 .hero-orb {
   position: absolute;
   width: 390px; height: 390px;

@@ -39,11 +39,13 @@ function getAllDeviceModels() {
   const map = new Map();
   for (const p of (peerState.peers || [])) {
     const key = p.hostname || p.ipv4;
+    const known = (appData.knownDevices && appData.knownDevices[key]) || {};
     map.set(key, {
       key,
       hostname: p.hostname || p.ipv4,
       displayName: appData.aliases[key] || p.hostname || p.ipv4,
       ipv4: p.ipv4,
+      mac: known.mac || '',
       online: true,
       cost: p.cost || 'p2p',
       lat: p.lat_ms && p.lat_ms !== '-' ? `${Number(p.lat_ms).toFixed(0)}ms` : '',
@@ -61,6 +63,7 @@ function getAllDeviceModels() {
         hostname: info.hostname || key,
         displayName: appData.aliases[key] || info.hostname || key,
         ipv4: info.ipv4 || '',
+        mac: info.mac || '',
         online: false,
         cost: 'offline',
         lat: '',
@@ -171,10 +174,10 @@ function renderDeviceDetail() {
 
   const ctaText = dev.online
     ? (dev.isNas ? '打开 NAS 管理后台 →' : '进入桌面 →')
-    : '设备当前离线';
+    : (dev.mac ? '⚡ 远程开机 (WOL)' : '⚡ 绑定 MAC 并远程开机');
   const subText = dev.online
     ? (dev.isNas ? `高速直连 · http://${dev.ipv4}:${nasPorts.http}` : `Windows RDP 极清远程桌面 · ${dev.ipv4}`)
-    : `上次记录 IP：${dev.ipv4 || '未知'}`;
+    : (dev.mac ? `已记录 MAC：${dev.mac} · 支持局域网及跨网协同唤醒` : `上次记录 IP：${dev.ipv4 || '未知'} · 点击设置 MAC 地址以启用远程开机`);
 
   panel.innerHTML = `
     <div class="dev-top-bar">
@@ -187,6 +190,7 @@ function renderDeviceDetail() {
         ${dev.online ? `<span class="meta-pill ${isP2p ? '' : 'relay'}">${isP2p ? 'P2P 直连' : escapeHtml(dev.cost)} ${dev.lat ? '· ' + escapeHtml(dev.lat) : ''}</span>` : ''}
       </div>
       <div class="top-actions">
+        <button class="subtle-btn" id="btnPower">⏻ 电源管理</button>
         <button class="subtle-btn ${isFav ? 'starred' : ''}" id="btnFav">${isFav ? '★ 已收藏' : '☆ 收藏'}</button>
         <button class="subtle-btn" id="btnRename">✎ 备注名</button>
       </div>
@@ -259,8 +263,91 @@ function renderDeviceDetail() {
     });
   }
 
+  async function triggerWake(macAddr) {
+    const onlineIps = (peerState.peers || []).map((p) => p.ipv4).filter(Boolean);
+    const res = await window.eriiApi.wakeDevice(macAddr, onlineIps);
+    if (res.ok) toast(res.message);
+    else toast(res.error || '发送唤醒包失败');
+  }
+
+  function openPowerModal() {
+    showModal(`
+      <h3 class="modal-title">远程电源管理 · ${escapeHtml(dev.displayName)}</h3>
+      <div class="power-grid">
+        ${dev.online ? `
+          <button class="power-btn" data-pact="lock">🔒 锁定屏幕</button>
+          <button class="power-btn" data-pact="sleep">🌙 远程睡眠</button>
+          <button class="power-btn" data-pact="reboot">🔄 远程重启 (5秒)</button>
+          <button class="power-btn danger" data-pact="shutdown">⏻ 远程关机 (5秒)</button>
+          <button class="power-btn" data-pact="cancel" style="grid-column:1/-1;">↩ 取消计划关机/重启</button>
+        ` : `
+          <button class="power-btn wake" id="modalWakeBtn">⚡ 发送远程开机魔术包 (Wake-on-LAN)</button>
+        `}
+      </div>
+      <div class="form-row" style="margin-bottom:6px;">
+        <label>设备物理网卡 MAC 地址（用于离线远程开机）</label>
+        <div style="display:flex;gap:8px;">
+          <input class="input" id="macInput" value="${escapeHtml(dev.mac || '')}" placeholder="例如 AA:BB:CC:DD:EE:FF" />
+          <button class="btn-sec" id="saveMacBtn" style="white-space:nowrap;">保存 MAC</button>
+        </div>
+        <div class="hint">两台电脑均运行 Erii 远程时会自动同步 MAC；远程开机需目标主板 BIOS 开启 Wake-on-LAN。</div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn-sec" onclick="closeModal()">关闭</button>
+      </div>
+    `);
+
+    document.querySelectorAll('[data-pact]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const act = btn.dataset.pact;
+        if ((act === 'shutdown' || act === 'reboot') && !confirm(`确定要对 ${dev.displayName} 执行「${act === 'shutdown' ? '远程关机' : '远程重启'}」吗？`)) {
+          return;
+        }
+        const res = await window.eriiApi.remotePower(dev.ipv4, act);
+        if (res.ok) {
+          toast(res.message);
+          closeModal();
+        } else {
+          toast(res.error || '指令执行失败');
+        }
+      });
+    });
+
+    const wakeBtn = document.getElementById('modalWakeBtn');
+    if (wakeBtn) {
+      wakeBtn.addEventListener('click', async () => {
+        const macVal = document.getElementById('macInput').value.trim();
+        if (!macVal) return toast('请先在下方输入该设备的物理网卡 MAC 地址');
+        if (!appData.knownDevices[dev.key]) appData.knownDevices[dev.key] = { hostname: dev.hostname, ipv4: dev.ipv4 };
+        appData.knownDevices[dev.key].mac = macVal;
+        await window.eriiApi.saveMeta({ knownDevices: appData.knownDevices });
+        await triggerWake(macVal);
+        closeModal();
+        renderAll();
+      });
+    }
+
+    document.getElementById('saveMacBtn').addEventListener('click', async () => {
+      const macVal = document.getElementById('macInput').value.trim();
+      if (!appData.knownDevices[dev.key]) appData.knownDevices[dev.key] = { hostname: dev.hostname, ipv4: dev.ipv4 };
+      appData.knownDevices[dev.key].mac = macVal;
+      await window.eriiApi.saveMeta({ knownDevices: appData.knownDevices });
+      toast('MAC 地址已保存');
+      renderAll();
+    });
+  }
+
+  document.getElementById('btnPower').addEventListener('click', openPowerModal);
+
   document.getElementById('heroConnect').addEventListener('click', async () => {
-    if (!dev.online) return toast('该设备当前离线');
+    if (!dev.online) {
+      if (dev.mac) {
+        await triggerWake(dev.mac);
+      } else {
+        openPowerModal();
+      }
+      return;
+    }
     if (dev.isNas) {
       await window.eriiApi.openUrl(`http://${dev.ipv4}:${nasPorts.http}`);
       toast('正在打开 NAS 后台...');
@@ -534,6 +621,13 @@ function renderSettings() {
         <textarea class="textarea" id="cfgPeers">${escapeHtml(peersText)}</textarea>
       </div>
       <div class="form-row switch-row">
+        <div>
+          <label style="margin:0;">允许被同局域网设备远程开关机 / 重启 / 锁屏</label>
+          <div class="hint">本机物理网卡 MAC：<code>${escapeHtml(appData.localMac || '未检测到')}</code></div>
+        </div>
+        <input type="checkbox" id="cfgAllowPower" ${cfg.allow_remote_power !== false ? 'checked' : ''} style="width:18px;height:18px;cursor:pointer;" />
+      </div>
+      <div class="form-row switch-row">
         <label style="margin:0;">开机自动启动 Erii 远程</label>
         <input type="checkbox" id="cfgAutoStart" ${cfg.autoStart ? 'checked' : ''} style="width:18px;height:18px;cursor:pointer;" />
       </div>
@@ -566,6 +660,7 @@ function renderSettings() {
       nas_http_port: Number(document.getElementById('cfgNasHttp').value) || 5666,
       nas_https_port: Number(document.getElementById('cfgNasHttps').value) || 5667,
       public_peers: document.getElementById('cfgPeers').value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
+      allow_remote_power: document.getElementById('cfgAllowPower').checked,
       autoStart: document.getElementById('cfgAutoStart').checked
     };
     await window.eriiApi.saveConfig(newCfg);
