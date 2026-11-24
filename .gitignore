@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+Thumbs.db
+
+# Do not commit EasyTier large binaries; download via `npm run download-easytier`
+resources/easytier/*.exe
+resources/easytier/*.dll
+resources/easytier/*.sys

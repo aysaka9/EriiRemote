@@ -1,0 +1,13 @@
+{
+  "network_name": "",
+  "network_secret": "",
+  "public_peers": [
+    "tcp://et.sumnight.top:11010",
+    "tcp://easytier.weiai.org.cn:11010",
+    "tcp://225284.xyz:11010"
+  ],
+  "use_dhcp": true,
+  "static_ip": "",
+  "nas_http_port": 5666,
+  "nas_https_port": 5667
+}
