@@ -766,6 +766,7 @@ function renderSettings() {
         <button class="btn-primary" id="btnSaveCfg">保存并连接</button>
         <button class="btn-sec" id="btnRestartEngine">重启组网引擎</button>
         <button class="btn-sec" id="btnCheckUpdate">🔄 检查局域网更新</button>
+        <button class="btn-sec" id="btnOpenLog">📄 查看运行日志</button>
       </div>
     </div>
   `;
@@ -822,6 +823,10 @@ function renderSettings() {
     toast('正在检查局域网内设备版本...');
     const res = await window.eriiApi.checkLanUpdate();
     if (res && !res.updating) toast(res.message || res.error || '当前已是最新版本');
+  });
+
+  document.getElementById('btnOpenLog').addEventListener('click', () => {
+    window.eriiApi.openLogFile();
   });
 }
 

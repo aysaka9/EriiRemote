@@ -37,6 +37,25 @@ function getDataFilePath() {
   return path.join(app.getPath('userData'), 'erii-remote-data.json');
 }
 
+function getLogFilePath() {
+  const dir = path.join(app.getPath('userData'), 'logs');
+  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  return path.join(dir, 'erii-remote.log');
+}
+
+function writeLog(level, msg) {
+  try {
+    const p = getLogFilePath();
+    if (fs.existsSync(p) && fs.statSync(p).size > 2 * 1024 * 1024) {
+      const bak = `${p}.old`;
+      try { fs.rmSync(bak, { force: true }); } catch {}
+      fs.renameSync(p, bak);
+    }
+    const ts = new Date().toISOString();
+    fs.appendFileSync(p, `[${ts}] [${level}] ${msg}\r\n`, 'utf8');
+  } catch {}
+}
+
 function loadDefaultConfig() {
   const defPath = getResourcePath('default_config.json');
   try {
@@ -551,15 +570,18 @@ async function checkPeerUpdate(peer, token, force = false) {
   const version = res.data.version;
   try {
     notifyRenderer('update-status', { stage: 'found', version, from: key });
+    writeLog('INFO', `Found update v${version} from ${key} (${peer.ipv4}), downloading...`);
     const dir = path.join(app.getPath('userData'), 'updates');
     fs.mkdirSync(dir, { recursive: true });
     const dest = path.join(dir, `EriiRemote-Setup-${version}.exe`);
     const ok = await downloadInstallerFromPeer(peer.ipv4, token, dest, inst.sha256, inst.size);
     if (!ok) {
+      writeLog('ERROR', `Failed to download/verify installer v${version} from ${peer.ipv4}`);
       notifyRenderer('update-status', { stage: 'failed', version });
       updateInProgress = false;
       return false;
     }
+    writeLog('INFO', `Downloaded & verified v${version}, launching silent installer...`);
     notifyRenderer('update-status', { stage: 'installing', version });
     setTimeout(async () => {
       // Wait 2s in a detached cmd wrapper so EriiRemote.exe and easytier-core.exe fully exit and unlock files before silent NSIS runs
@@ -707,14 +729,19 @@ async function startEasyTierEngine(forceRestart = false) {
     });
     easytierProc = proc;
     engineMode = 'builtin';
+    writeLog('INFO', `Started built-in easytier-core (pid=${proc.pid}, dhcp=${Boolean(cfg.use_dhcp)}, static=${cfg.static_ip || ''})`);
 
     proc.stderr.on('data', (chunk) => {
       if (easytierProc !== proc) return;
       const msg = chunk.toString('utf-8').trim();
-      if (msg) engineLastError = msg.slice(-300);
+      if (msg) {
+        engineLastError = msg.slice(-300);
+        writeLog('WARN', `easytier-core stderr: ${engineLastError}`);
+      }
     });
     proc.on('exit', (code) => {
       if (easytierProc !== proc) return;
+      writeLog('WARN', `easytier-core exited with code ${code}`);
       easytierProc = null;
       if (!isQuitting) {
         engineMode = code === 0 ? 'stopped' : 'error';
@@ -724,6 +751,7 @@ async function startEasyTierEngine(forceRestart = false) {
   } catch (e) {
     engineMode = 'error';
     engineLastError = String(e.message || e);
+    writeLog('ERROR', `Failed to spawn easytier-core: ${engineLastError}`);
     return { ok: false, error: engineLastError };
   }
 }
@@ -775,6 +803,7 @@ async function execCliPeer(cliExe, portalAddr) {
     const peerRes = await runCliJson(cliExe, portalAddr, 'peer', 2500);
     if (peerRes.ok) return peerRes;
     // `easytier-cli peer` can hang when a public server RPC stalls; fall back to instant `route`
+    writeLog('WARN', `easytier-cli peer (${portalAddr}) failed/timed out, switching to route fallback`);
     skipSlowPeerUntil = Date.now() + 2 * 60 * 1000;
   }
   const routeRes = await runCliJson(cliExe, portalAddr, 'route', 3000);
@@ -975,6 +1004,7 @@ app.on('second-instance', () => {
 });
 
 app.whenReady().then(async () => {
+  writeLog('INFO', `EriiRemote v${app.getVersion()} starting (packaged=${app.isPackaged})`);
   createWindow();
   createTray();
   getShareDir();
@@ -1014,6 +1044,7 @@ ipcMain.handle('get-app-data', () => {
   d.localMac = getLocalNetworkMeta().primaryMac;
   d.appVersion = app.getVersion();
   d.shareDir = getShareDir();
+  d.logFile = getLogFilePath();
   return d;
 });
 
@@ -1383,6 +1414,13 @@ ipcMain.handle('check-lan-update', async () => {
     if (started) return { ok: true, updating: true };
   }
   return { ok: true, updating: false, message: '当前已是局域网内最新版本' };
+});
+
+ipcMain.handle('open-log-file', () => {
+  const p = getLogFilePath();
+  if (fs.existsSync(p)) shell.showItemInFolder(p);
+  else shell.openPath(path.dirname(p));
+  return { ok: true, path: p };
 });
 
 ipcMain.handle('restart-engine', () => startEasyTierEngine(true));
