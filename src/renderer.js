@@ -465,7 +465,7 @@ function renderDeviceDetail() {
       await window.eriiApi.openUrl(`http://${dev.ipv4}:${nasPorts.http}`);
       toast('正在打开 NAS 后台...');
     } else {
-      await window.eriiApi.connectRdp(dev.ipv4);
+      await window.eriiApi.connectRdp(dev.ipv4, dev.hostname);
       toast(`正在通过 RDP 连接 ${dev.displayName}...`);
     }
   });
@@ -590,7 +590,7 @@ function renderDeviceDetail() {
       if (e.target.dataset.qdel !== undefined) return;
       const item = quickItems[Number(card.dataset.qidx)];
       if (!item) return;
-      if (item.type === 'rdp') window.eriiApi.connectRdp(dev.ipv4);
+      if (item.type === 'rdp') window.eriiApi.connectRdp(dev.ipv4, dev.hostname);
       else if (item.type === 'smb') window.eriiApi.openSmb(dev.ipv4);
       else window.eriiApi.openUrl(item.target);
     });

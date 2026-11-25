@@ -8,7 +8,7 @@ contextBridge.exposeInMainWorld('eriiApi', {
   getAppData: () => ipcRenderer.invoke('get-app-data'),
   saveConfig: (cfg) => ipcRenderer.invoke('save-config', cfg),
   saveMeta: (patch) => ipcRenderer.invoke('save-meta', patch),
-  connectRdp: (ip) => ipcRenderer.invoke('connect-rdp', ip),
+  connectRdp: (ip, hostname) => ipcRenderer.invoke('connect-rdp', { ip, hostname }),
   connectMoonlight: (ip) => ipcRenderer.invoke('connect-moonlight', ip),
   openSmb: (ip) => ipcRenderer.invoke('open-smb', ip),
   openUrl: (url) => ipcRenderer.invoke('open-url', url),

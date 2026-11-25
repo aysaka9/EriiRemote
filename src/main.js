@@ -1002,11 +1002,54 @@ function ensureRdpDynamicResolution() {
   } catch {}
 }
 
-ipcMain.handle('connect-rdp', (_e, ip) => {
+function toEriiDomain(hostname) {
+  const label = String(hostname || '').trim().toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '');
+  return label ? `${label}.erii` : '';
+}
+
+let lastHostsSignature = '';
+function syncHostsEntries(entries) {
+  try {
+    const valid = (entries || [])
+      .map((e) => ({ ip: String(e.ip || '').trim(), domain: toEriiDomain(e.hostname) }))
+      .filter((e) => e.ip && e.domain);
+    if (!valid.length) return false;
+    const sig = valid.map((e) => `${e.ip}=${e.domain}`).sort().join('|');
+    if (sig === lastHostsSignature) return true;
+
+    const hostsPath = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'drivers', 'etc', 'hosts');
+    const raw = fs.existsSync(hostsPath) ? fs.readFileSync(hostsPath, 'utf8') : '';
+    const eol = raw.includes('\r\n') ? '\r\n' : '\n';
+    const domains = new Set(valid.map((e) => e.domain));
+    const lines = raw.split(/\r?\n/).filter((line) => {
+      const m = line.match(/#\s*EriiRemote:([^\s]+)/);
+      if (m && domains.has(m[1])) return false;
+      return true;
+    });
+    while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
+    for (const e of valid) {
+      lines.push(`${e.ip} ${e.domain} # EriiRemote:${e.domain}`);
+    }
+    fs.writeFileSync(hostsPath, lines.join(eol) + eol, 'utf8');
+    lastHostsSignature = sig;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+ipcMain.handle('connect-rdp', (_e, payload) => {
+  const ip = typeof payload === 'string' ? payload : (payload && payload.ip);
+  const hostname = typeof payload === 'object' && payload ? payload.hostname : '';
   if (!ip) return { ok: false, error: '无效 IP' };
   ensureRdpDynamicResolution();
-  spawn('mstsc.exe', [`/v:${ip}`], { detached: true, stdio: 'ignore' }).unref();
-  return { ok: true };
+  let target = ip;
+  const domain = toEriiDomain(hostname);
+  if (domain && syncHostsEntries([{ ip, hostname }])) {
+    target = domain;
+  }
+  spawn('mstsc.exe', [`/v:${target}`], { detached: true, stdio: 'ignore' }).unref();
+  return { ok: true, target };
 });
 
 ipcMain.handle('connect-moonlight', (_e, ip) => {
