@@ -584,9 +584,28 @@ async function checkPeerUpdate(peer, token, force = false) {
     writeLog('INFO', `Downloaded & verified v${version}, launching silent installer...`);
     notifyRenderer('update-status', { stage: 'installing', version });
     setTimeout(async () => {
-      // Wait 2s in a detached cmd wrapper so EriiRemote.exe and easytier-core.exe fully exit and unlock files before silent NSIS runs
-      const cmd = `ping -n 3 127.0.0.1 >nul && start "" "${dest}" /S --force-run`;
-      spawn('cmd.exe', ['/c', cmd], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+      // Write a UTF-8 batch updater (with chcp 65001 for Chinese exe name) so Node never mangles cmd quotes,
+      // wait for silent NSIS (/S) to finish, then relaunch Erii远程.exe cleanly.
+      const batPath = path.join(dir, 'run-update.bat');
+      const batContent = [
+        '@echo off',
+        'chcp 65001 >nul',
+        'ping -n 3 127.0.0.1 >nul',
+        '"%~1" /S',
+        'if exist "%~2" (',
+        '  start "" "%~2"',
+        ') else if exist "%ProgramFiles%\\Erii远程\\Erii远程.exe" (',
+        '  start "" "%ProgramFiles%\\Erii远程\\Erii远程.exe"',
+        ')',
+        'del "%~f0"'
+      ].join('\r\n') + '\r\n';
+      fs.writeFileSync(batPath, batContent, 'utf8');
+      writeLog('INFO', `Executing updater batch: ${batPath} dest=${dest} exe=${process.execPath}`);
+      spawn('cmd.exe', ['/c', batPath, dest, process.execPath], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true
+      }).unref();
       isQuitting = true;
       if (easytierProc && easytierProc.pid) {
         await killProcessSync(easytierProc.pid);
