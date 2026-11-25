@@ -141,6 +141,16 @@ html, body {
 .dev-lat {
   font-size: 11px; color: var(--text-muted); font-family: ui-monospace, Consolas, monospace;
 }
+.dev-ver-sub {
+  font-size: 10px; color: var(--text-muted); font-family: ui-monospace, Consolas, monospace; margin-top: 2px;
+}
+.dev-ver-sub.outdated { color: #d97706; font-weight: 600; }
+.ver-pill {
+  font-size: 11px; font-family: ui-monospace, Consolas, monospace; font-weight: 600;
+  padding: 3px 9px; border-radius: 999px;
+  background: rgba(37, 99, 235, 0.09); color: var(--primary);
+}
+.ver-pill.outdated { background: rgba(245, 158, 11, 0.14); color: #b45309; }
 
 .nav-icon {
   width: 24px; height: 24px; border-radius: 6px; display: grid; place-items: center; flex-shrink: 0;

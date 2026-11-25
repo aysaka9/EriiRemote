@@ -15,6 +15,16 @@ function escapeHtml(s) {
   return String(s || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+function compareVersions(a, b) {
+  const pa = String(a || '0').split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = String(b || '0').split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d !== 0) return d > 0 ? 1 : -1;
+  }
+  return 0;
+}
+
 function randomString(len) {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
   let out = '';
@@ -113,12 +123,14 @@ function renderSidebar() {
       const iconSvg = d.isNas
         ? `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><circle cx="7" cy="7" r="1" fill="currentColor"/><circle cx="7" cy="17" r="1" fill="currentColor"/></svg>`
         : `<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><path d="M3 5.5L10.5 4.4V11.3H3V5.5ZM11.5 4.2L21 2.8V11.3H11.5V4.2ZM3 12.3H10.5V19.2L3 18.1V12.3ZM11.5 12.3H21V20.8L11.5 19.4V12.3Z"/></svg>`;
+      const isOutdated = d.appVersion && appData.appVersion && compareVersions(d.appVersion, appData.appVersion) < 0;
       return `
         <button class="nav-item ${isActive ? 'active' : ''}" data-dev="${escapeHtml(d.key)}">
           <span class="dev-dot ${d.online ? 'on' : 'off'}"></span>
           <span class="dev-badge-icon ${d.online ? (d.isNas ? 'nas' : '') : 'offline'}">${iconSvg}</span>
           <div class="dev-name-wrap">
             <div class="dev-name ${d.online ? '' : 'offline'}">${escapeHtml(d.displayName)}</div>
+            ${d.appVersion ? `<div class="dev-ver-sub ${isOutdated ? 'outdated' : ''}">v${escapeHtml(d.appVersion)}${isOutdated ? ' · 旧版' : ''}</div>` : ''}
           </div>
           ${d.online && d.lat ? `<span class="dev-lat">${escapeHtml(d.lat)}</span>` : ''}
         </button>`;
@@ -190,6 +202,7 @@ function renderDeviceDetail() {
         <h1 class="dev-main-title">${escapeHtml(dev.displayName)}</h1>
         ${dev.ipv4 ? `<button class="ip-chip" id="copyDevIp" title="点击复制 IP">${escapeHtml(dev.ipv4)}</button>` : ''}
         ${dev.online ? `<span class="meta-pill ${isP2p ? '' : 'relay'}">${isP2p ? 'P2P 直连' : escapeHtml(dev.cost)} ${dev.lat ? '· ' + escapeHtml(dev.lat) : ''}</span>` : ''}
+        ${dev.appVersion ? `<span class="ver-pill ${appData.appVersion && compareVersions(dev.appVersion, appData.appVersion) < 0 ? 'outdated' : ''}">Erii v${escapeHtml(dev.appVersion)}</span>` : ''}
       </div>
       <div class="top-actions">
         <button class="subtle-btn" id="btnPower">⏻ 电源管理</button>
@@ -634,6 +647,7 @@ function renderDevicesGrid(onlyFavorites = false) {
           </div>
           <div class="dev-card-kv"><span>虚拟 IP</span><code>${escapeHtml(d.ipv4 || '-')}</code></div>
           <div class="dev-card-kv"><span>连接方式</span><span>${d.online ? `${escapeHtml(d.cost)} ${escapeHtml(d.lat)}` : '离线'}</span></div>
+          <div class="dev-card-kv"><span>软件版本</span><span>${d.appVersion ? `v${escapeHtml(d.appVersion)}` : '-'}</span></div>
           <div class="dev-card-kv"><span>NAT 类型</span><span>${escapeHtml(d.nat)}</span></div>
         </div>
       `).join('')}

@@ -562,7 +562,10 @@ async function findHighestPeerUpdate(peers, token) {
   for (const item of probed) {
     if (!item) continue;
     const key = item.peer.hostname || item.peer.ipv4;
-    if (latest.knownDevices[key] && latest.knownDevices[key].appVersion !== item.data.version) {
+    if (!latest.knownDevices[key]) {
+      latest.knownDevices[key] = { hostname: item.peer.hostname, ipv4: item.peer.ipv4, lastSeen: Date.now() };
+    }
+    if (latest.knownDevices[key].appVersion !== item.data.version) {
       latest.knownDevices[key].appVersion = item.data.version;
       dirty = true;
     }
@@ -575,6 +578,26 @@ async function findHighestPeerUpdate(peers, token) {
   }
   if (dirty) saveAppData(latest);
   return best;
+}
+
+const probedVerIps = new Set();
+async function probePeerVersionIfMissing(peer, data, token) {
+  if (!token || !peer.ipv4) return;
+  const key = peer.hostname || peer.ipv4;
+  if (probedVerIps.has(peer.ipv4)) return;
+  probedVerIps.add(peer.ipv4);
+  setTimeout(() => probedVerIps.delete(peer.ipv4), 60000);
+  const res = await httpJsonRequest(peer.ipv4, 'GET', '/api/version', null, token, 2000);
+  if (res.status === 200 && res.data && res.data.version) {
+    const latest = loadAppData();
+    if (!latest.knownDevices[key]) {
+      latest.knownDevices[key] = { hostname: peer.hostname, ipv4: peer.ipv4, lastSeen: Date.now() };
+    }
+    if (latest.knownDevices[key].appVersion !== res.data.version) {
+      latest.knownDevices[key].appVersion = res.data.version;
+      saveAppData(latest);
+    }
+  }
 }
 
 async function checkAllPeersUpdate(peers, token, force = false) {
@@ -972,6 +995,7 @@ function queryPeers() {
           data.knownDevices[key].lastSeen = Date.now();
         }
         probePeerMacIfNeeded(p, data, token);
+        probePeerVersionIfMissing(p, data, token);
       }
       if (dirty) saveAppData(data);
       checkAllPeersUpdate(peers, token, false);
