@@ -619,29 +619,39 @@ async function checkAllPeersUpdate(peers, token, force = false) {
     writeLog('INFO', `Downloaded & verified v${version}, launching silent installer...`);
     notifyRenderer('update-status', { stage: 'installing', version });
     setTimeout(async () => {
-      const batPath = path.join(dir, 'run-update.bat');
+      // Use a UTF-8 BOM PowerShell script with baked-in paths (zero cmd.exe quote/GBK pitfalls, no black window)
+      const ps1Path = path.join(dir, 'run-update.ps1');
       const updLog = path.join(app.getPath('userData'), 'logs', 'updater.log');
-      const batContent = [
-        '@echo off',
-        'chcp 65001 >nul',
-        `echo [%date% %time%] Updater started >> "${updLog}"`,
-        'ping -n 3 127.0.0.1 >nul',
-        `echo [%date% %time%] Running silent installer: "%~1" >> "${updLog}"`,
-        'start "" /wait "%~1" /S',
-        `echo [%date% %time%] Installer finished with exit code %errorlevel% >> "${updLog}"`,
-        'ping -n 2 127.0.0.1 >nul',
-        'if exist "%~2" (',
-        `  echo [%date% %time%] Relaunching "%~2" >> "${updLog}"`,
-        '  start "" "%~2"',
-        ') else if exist "%ProgramFiles%\\Erii远程\\Erii远程.exe" (',
-        `  echo [%date% %time%] Relaunching ProgramFiles exe >> "${updLog}"`,
-        '  start "" "%ProgramFiles%\\Erii远程\\Erii远程.exe"',
-        ')',
-        'del "%~f0"'
+      const escPs = (s) => String(s || '').replace(/'/g, "''");
+      const ps1Content = [
+        '$ErrorActionPreference = "Continue"',
+        `$log = '${escPs(updLog)}'`,
+        'function Log($m) { Add-Content -Path $log -Value ("[" + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + "] " + $m) -Encoding UTF8 }',
+        'Log "Updater PS1 started"',
+        'Start-Sleep -Seconds 3',
+        `$installer = '${escPs(dest)}'`,
+        `$exePath = '${escPs(process.execPath)}'`,
+        'Log "Running silent installer: $installer"',
+        'try {',
+        '  $p = Start-Process -FilePath $installer -ArgumentList "/S" -Wait -PassThru',
+        '  Log "Installer exited with code: $($p.ExitCode)"',
+        '} catch {',
+        '  Log "Installer error: $($_.Exception.Message)"',
+        '}',
+        'Start-Sleep -Seconds 2',
+        '$candidates = @($exePath, (Join-Path $env:ProgramFiles "Erii远程\\Erii远程.exe"), (Join-Path $env:LOCALAPPDATA "Programs\\erii-remote\\Erii远程.exe"))',
+        'foreach ($c in $candidates) {',
+        '  if ($c -and (Test-Path $c)) {',
+        '    Log "Relaunching: $c"',
+        '    Start-Process -FilePath $c',
+        '    break',
+        '  }',
+        '}',
+        `Remove-Item -LiteralPath '${escPs(ps1Path)}' -Force -ErrorAction SilentlyContinue`
       ].join('\r\n') + '\r\n';
-      fs.writeFileSync(batPath, batContent, 'utf8');
-      writeLog('INFO', `Executing updater batch: ${batPath} dest=${dest} exe=${process.execPath}`);
-      spawn('cmd.exe', ['/c', batPath, dest, process.execPath], {
+      fs.writeFileSync(ps1Path, '\uFEFF' + ps1Content, 'utf8');
+      writeLog('INFO', `Executing updater ps1: ${ps1Path} dest=${dest} exe=${process.execPath}`);
+      spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ps1Path], {
         detached: true,
         stdio: 'ignore',
         windowsHide: true
