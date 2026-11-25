@@ -673,9 +673,15 @@ function renderSettings() {
       auto_update: document.getElementById('cfgAutoUpdate').checked,
       autoStart: document.getElementById('cfgAutoStart').checked
     };
-    await window.eriiApi.saveConfig(newCfg);
+    const saveRes = await window.eriiApi.saveConfig(newCfg);
     appData = await window.eriiApi.getAppData();
-    toast('设置已保存，正在连接异地局域网...');
+    if (saveRes && saveRes.engine && saveRes.engine.note) {
+      toast(saveRes.engine.note);
+    } else if (saveRes && saveRes.autoStart && !saveRes.autoStart.ok) {
+      toast('配置已保存，但设置开机自启失败（请以管理员身份运行）');
+    } else {
+      toast('设置已保存，正在重连异地局域网...');
+    }
     setTimeout(() => refreshPeers(false), 1800);
   });
 
@@ -707,7 +713,13 @@ function renderAll() {
 async function refreshPeers(showMsg = false) {
   peerState = await window.eriiApi.getPeers();
   if (peerState.knownDevices) appData.knownDevices = peerState.knownDevices;
-  renderAll();
+  // Never overwrite form inputs on settings/direct pages or while a modal is open
+  const modalOpen = document.getElementById('modalMask').classList.contains('show');
+  if (!showMsg && (activeView === 'settings' || activeView === 'direct' || modalOpen)) {
+    renderSidebar();
+  } else {
+    renderAll();
+  }
   if (showMsg) toast('已刷新在线设备状态');
 }
 window.refreshPeers = refreshPeers;

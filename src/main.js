@@ -496,14 +496,53 @@ function checkExternalEasyTier() {
   });
 }
 
+function killProcessSync(pid) {
+  return new Promise((resolve) => {
+    if (!pid) return resolve();
+    execFile('taskkill', ['/F', '/T', '/PID', String(pid)], { windowsHide: true }, () => resolve());
+  });
+}
+
+function setWindowsAutoStart(enable) {
+  return new Promise((resolve) => {
+    try { app.setLoginItemSettings({ openAtLogin: false }); } catch {}
+    if (!app.isPackaged) return resolve({ ok: true, skipped: true });
+    const taskName = 'EriiRemote_AutoStart';
+    if (enable) {
+      execFile('schtasks', [
+        '/Create', '/TN', taskName,
+        '/TR', `"${process.execPath}"`,
+        '/SC', 'ONLOGON',
+        '/RL', 'HIGHEST',
+        '/F'
+      ], { windowsHide: true }, (err, _stdout, stderr) => {
+        resolve({ ok: !err, error: err ? String(stderr || err.message) : '' });
+      });
+    } else {
+      execFile('schtasks', ['/Delete', '/TN', taskName, '/F'], { windowsHide: true }, () => {
+        resolve({ ok: true });
+      });
+    }
+  });
+}
+
 async function startEasyTierEngine(forceRestart = false) {
   const data = loadAppData();
   const cfg = data.config;
 
-  if (forceRestart && easytierProc) {
-    try { easytierProc.kill(); } catch {}
-    easytierProc = null;
-    await new Promise((r) => setTimeout(r, 800));
+  if (forceRestart) {
+    if (easytierProc) {
+      const oldProc = easytierProc;
+      easytierProc = null;
+      await killProcessSync(oldProc.pid);
+      await new Promise((r) => setTimeout(r, 600));
+    } else if (engineMode === 'external' || await checkExternalEasyTier()) {
+      // Stop standalone easytier-core.exe so the new config (e.g. static IP) can take effect
+      await new Promise((r) => {
+        execFile('taskkill', ['/F', '/IM', 'easytier-core.exe'], { windowsHide: true }, () => r());
+      });
+      await new Promise((r) => setTimeout(r, 700));
+    }
   }
 
   if (!easytierProc) {
@@ -511,7 +550,11 @@ async function startEasyTierEngine(forceRestart = false) {
     if (externalRunning) {
       engineMode = 'external';
       engineLastError = '';
-      return { ok: true, mode: 'external' };
+      return {
+        ok: true,
+        mode: 'external',
+        note: forceRestart ? '检测到系统后台 EasyTier 服务仍在运行，配置未覆盖该外部服务' : ''
+      };
     }
   } else {
     engineMode = 'builtin';
@@ -549,17 +592,20 @@ async function startEasyTierEngine(forceRestart = false) {
 
   try {
     engineLastError = '';
-    easytierProc = spawn(coreExe, args, {
+    const proc = spawn(coreExe, args, {
       cwd: path.dirname(coreExe),
       windowsHide: true
     });
+    easytierProc = proc;
     engineMode = 'builtin';
 
-    easytierProc.stderr.on('data', (chunk) => {
+    proc.stderr.on('data', (chunk) => {
+      if (easytierProc !== proc) return;
       const msg = chunk.toString('utf-8').trim();
       if (msg) engineLastError = msg.slice(-300);
     });
-    easytierProc.on('exit', (code) => {
+    proc.on('exit', (code) => {
+      if (easytierProc !== proc) return;
       easytierProc = null;
       if (!isQuitting) {
         engineMode = code === 0 ? 'stopped' : 'error';
@@ -794,11 +840,9 @@ ipcMain.handle('save-config', async (_e, newCfg) => {
   const data = loadAppData();
   data.config = { ...data.config, ...newCfg };
   saveAppData(data);
-  try {
-    app.setLoginItemSettings({ openAtLogin: Boolean(data.config.autoStart) });
-  } catch {}
+  const autoRes = await setWindowsAutoStart(Boolean(data.config.autoStart));
   const res = await startEasyTierEngine(true);
-  return { ok: true, engine: res };
+  return { ok: true, engine: res, autoStart: autoRes };
 });
 
 ipcMain.handle('save-meta', (_e, patch) => {
