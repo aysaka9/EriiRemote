@@ -627,8 +627,51 @@ ipcMain.handle('save-meta', (_e, patch) => {
   return { ok: true };
 });
 
+// Ensure mstsc's Default.rdp enables dynamic resolution (remote resolution follows window resize)
+function ensureRdpDynamicResolution() {
+  try {
+    const p = path.join(app.getPath('documents'), 'Default.rdp');
+    const wanted = { 'dynamic resolution': 'i:1', 'smart sizing': 'i:0' };
+    let text = '';
+    const exists = fs.existsSync(p);
+    if (exists) {
+      const buf = fs.readFileSync(p);
+      text = (buf[0] === 0xff && buf[1] === 0xfe)
+        ? buf.slice(2).toString('utf16le')
+        : buf.toString('utf8').replace(/^\uFEFF/, '');
+    }
+    const lines = text.split(/\r?\n/).filter((l) => l.trim() !== '');
+    let changed = !exists;
+    for (const [k, v] of Object.entries(wanted)) {
+      const line = `${k}:${v}`;
+      const idx = lines.findIndex((l) => l.toLowerCase().startsWith(`${k}:`));
+      if (idx >= 0) {
+        if (lines[idx] !== line) { lines[idx] = line; changed = true; }
+      } else {
+        lines.push(line);
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    const out = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(lines.join('\r\n') + '\r\n', 'utf16le')]);
+    if (exists) {
+      // Default.rdp is a hidden file; open with r+ to avoid EPERM on Windows
+      const fd = fs.openSync(p, 'r+');
+      try {
+        fs.ftruncateSync(fd, 0);
+        fs.writeSync(fd, out, 0, out.length, 0);
+      } finally {
+        fs.closeSync(fd);
+      }
+    } else {
+      fs.writeFileSync(p, out);
+    }
+  } catch {}
+}
+
 ipcMain.handle('connect-rdp', (_e, ip) => {
   if (!ip) return { ok: false, error: '无效 IP' };
+  ensureRdpDynamicResolution();
   spawn('mstsc.exe', [`/v:${ip}`], { detached: true, stdio: 'ignore' }).unref();
   return { ok: true };
 });
