@@ -17,5 +17,12 @@ contextBridge.exposeInMainWorld('eriiApi', {
   remotePower: (ip, action) => ipcRenderer.invoke('remote-power', { ip, action }),
   wakeDevice: (mac, onlinePeerIps) => ipcRenderer.invoke('wake-device', { mac, onlinePeerIps }),
   restartEngine: () => ipcRenderer.invoke('restart-engine'),
-  onUpdateStatus: (cb) => ipcRenderer.on('update-status', (_e, s) => cb(s))
+  onUpdateStatus: (cb) => ipcRenderer.on('update-status', (_e, s) => cb(s)),
+  openShareDir: () => ipcRenderer.invoke('open-share-dir'),
+  revealFile: (p) => ipcRenderer.invoke('reveal-file', p),
+  listRemoteFiles: (ip) => ipcRenderer.invoke('list-remote-files', ip),
+  uploadFilesToPeer: (ip, filePaths) => ipcRenderer.invoke('upload-files-to-peer', { ip, filePaths }),
+  downloadFileFromPeer: (ip, name) => ipcRenderer.invoke('download-file-from-peer', { ip, name }),
+  deleteRemoteFile: (ip, name) => ipcRenderer.invoke('delete-remote-file', { ip, name }),
+  onFileTransferProgress: (cb) => ipcRenderer.on('file-transfer-progress', (_e, s) => cb(s))
 });

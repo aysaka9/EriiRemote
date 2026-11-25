@@ -265,6 +265,117 @@ function renderDeviceDetail() {
     });
   }
 
+  function formatBytes(bytes) {
+    if (!bytes && bytes !== 0) return '-';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let v = Number(bytes);
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
+    return `${i === 0 ? v : v.toFixed(1)} ${units[i]}`;
+  }
+
+  async function openFileTransferModal(targetDev) {
+    const card = document.getElementById('modalCard');
+    card.classList.add('wide');
+    showModal(`
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+        <h3 class="modal-title" style="margin:0;">共享文件互传 · ${escapeHtml(targetDev.displayName)}</h3>
+        <div style="display:flex;gap:6px;">
+          <button class="subtle-btn" id="ftOpenLocal">📂 本机共享目录</button>
+          <button class="subtle-btn" id="ftOpenSmb">SMB 共享</button>
+        </div>
+      </div>
+      <div class="drop-area" id="ftDrop">
+        <div style="font-size:13px;font-weight:600;color:var(--text-main);">拖拽文件到这里，或点击选择文件发送给对方</div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:4px;">文件将直接存入对方「文档\\EriiRemote共享」文件夹（走局域网加密直连）</div>
+      </div>
+      <div class="ft-prog" id="ftProg"></div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+        <span style="font-size:12px;font-weight:600;color:var(--text-sub);">对方共享文件夹内容</span>
+        <button class="subtle-btn" id="ftRefresh" style="height:26px;font-size:11px;">刷新列表</button>
+      </div>
+      <div class="ft-list" id="ftList"><div style="padding:20px;text-align:center;font-size:12px;color:var(--text-muted);">正在读取对方共享目录...</div></div>
+      <div class="modal-actions">
+        <button class="btn-sec" onclick="closeModal()">关闭</button>
+      </div>
+    `);
+
+    async function loadRemoteList() {
+      const listEl = document.getElementById('ftList');
+      if (!listEl) return;
+      const res = await window.eriiApi.listRemoteFiles(targetDev.ipv4);
+      if (!res.ok) {
+        listEl.innerHTML = `<div style="padding:20px;text-align:center;font-size:12px;color:var(--danger);">${escapeHtml(res.error || '读取失败')}</div>`;
+        return;
+      }
+      if (!res.files.length) {
+        listEl.innerHTML = `<div style="padding:22px;text-align:center;font-size:12px;color:var(--text-muted);">对方共享文件夹暂无文件，直接拖拽文件到上方即可发送给对方</div>`;
+        return;
+      }
+      listEl.innerHTML = res.files.map((f) => `
+        <div class="ft-item">
+          <div style="min-width:0;flex:1;">
+            <div class="ft-name">${escapeHtml(f.name)}</div>
+            <div class="ft-meta">${formatBytes(f.size)} · ${new Date(f.mtime).toLocaleString()}</div>
+          </div>
+          <div style="display:flex;gap:6px;flex-shrink:0;">
+            <button class="btn-primary" style="padding:5px 11px;font-size:12px;" data-ftdl="${escapeHtml(f.name)}">下载</button>
+            <button class="btn-sec" style="padding:5px 9px;font-size:12px;color:var(--danger);" data-ftdel="${escapeHtml(f.name)}">删除</button>
+          </div>
+        </div>
+      `).join('');
+
+      listEl.querySelectorAll('[data-ftdl]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const fname = btn.dataset.ftdl;
+          btn.disabled = true; btn.textContent = '下载中...';
+          const r = await window.eriiApi.downloadFileFromPeer(targetDev.ipv4, fname);
+          btn.disabled = false; btn.textContent = '下载';
+          if (r.ok) {
+            toast(`已下载到本机共享目录：${fname}`);
+            window.eriiApi.revealFile(r.localPath);
+          } else {
+            toast(r.error || '下载失败');
+          }
+        });
+      });
+
+      listEl.querySelectorAll('[data-ftdel]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const fname = btn.dataset.ftdel;
+          if (!confirm(`确定删除对方共享文件夹中的「${fname}」吗？`)) return;
+          const ok = await window.eriiApi.deleteRemoteFile(targetDev.ipv4, fname);
+          if (ok && ok.ok) { toast('已删除'); loadRemoteList(); }
+          else toast('删除失败');
+        });
+      });
+    }
+
+    document.getElementById('ftOpenLocal').addEventListener('click', () => window.eriiApi.openShareDir());
+    document.getElementById('ftOpenSmb').addEventListener('click', () => window.eriiApi.openSmb(targetDev.ipv4));
+    document.getElementById('ftRefresh').addEventListener('click', loadRemoteList);
+
+    const dropEl = document.getElementById('ftDrop');
+    dropEl.addEventListener('click', async () => {
+      const r = await window.eriiApi.uploadFilesToPeer(targetDev.ipv4, []);
+      if (r && r.ok) { toast(`已发送 ${r.count} 个文件到对方共享文件夹`); loadRemoteList(); }
+      else if (r && !r.canceled) toast(r.error || '发送失败');
+    });
+    dropEl.addEventListener('dragover', (e) => { e.preventDefault(); dropEl.classList.add('drag'); });
+    dropEl.addEventListener('dragleave', () => dropEl.classList.remove('drag'));
+    dropEl.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      dropEl.classList.remove('drag');
+      const paths = Array.from(e.dataTransfer.files || []).map((f) => f.path).filter(Boolean);
+      if (!paths.length) return;
+      const r = await window.eriiApi.uploadFilesToPeer(targetDev.ipv4, paths);
+      if (r && r.ok) { toast(`已发送 ${r.count} 个文件到对方共享文件夹`); loadRemoteList(); }
+      else toast((r && r.error) || '发送失败');
+    });
+
+    loadRemoteList();
+  }
+
   async function triggerWake(macAddr) {
     const onlineIps = (peerState.peers || []).map((p) => p.ipv4).filter(Boolean);
     const res = await window.eriiApi.wakeDevice(macAddr, onlineIps);
@@ -361,8 +472,12 @@ function renderDeviceDetail() {
 
   document.getElementById('toolFiles').addEventListener('click', async () => {
     if (!dev.online) return toast('设备离线');
-    await window.eriiApi.openSmb(dev.ipv4);
-    toast(`正在打开 \\\\${dev.ipv4} 共享文件...`);
+    if (dev.isNas) {
+      await window.eriiApi.openSmb(dev.ipv4);
+      toast(`正在打开 \\\\${dev.ipv4} 共享文件...`);
+      return;
+    }
+    openFileTransferModal(dev);
   });
 
   document.getElementById('toolMoonlight').addEventListener('click', async () => {
@@ -631,6 +746,13 @@ function renderSettings() {
       </div>
       <div class="form-row switch-row">
         <div>
+          <label style="margin:0;">本机共享文件夹（互传文件默认目录）</label>
+          <div class="hint"><code>${escapeHtml(appData.shareDir || '文档\\EriiRemote共享')}</code></div>
+        </div>
+        <button class="subtle-btn" id="btnOpenShareDir">📂 打开文件夹</button>
+      </div>
+      <div class="form-row switch-row">
+        <div>
           <label style="margin:0;">自动从局域网内同步升级</label>
           <div class="hint">发现同局域网设备运行更新版本的 Erii 远程时，自动下载校验并静默升级</div>
         </div>
@@ -646,6 +768,10 @@ function renderSettings() {
       </div>
     </div>
   `;
+
+  document.getElementById('btnOpenShareDir').addEventListener('click', () => {
+    window.eriiApi.openShareDir();
+  });
 
   document.getElementById('btnGenRand').addEventListener('click', () => {
     document.getElementById('cfgNet').value = 'erii-lan-' + randomString(6).toLowerCase();
@@ -698,6 +824,7 @@ function showModal(html) {
 }
 function closeModal() {
   document.getElementById('modalMask').classList.remove('show');
+  document.getElementById('modalCard').classList.remove('wide');
 }
 window.closeModal = closeModal;
 
@@ -755,6 +882,17 @@ window.refreshPeers = refreshPeers;
       else if (s.stage === 'downloading') toast(`正在同步新版本... ${s.percent}%`);
       else if (s.stage === 'installing') toast(`新版本 v${s.version} 校验通过，3 秒后自动静默升级并重启`);
       else if (s.stage === 'failed') toast('局域网同步升级失败，稍后自动重试');
+    });
+  }
+  if (window.eriiApi.onFileTransferProgress) {
+    window.eriiApi.onFileTransferProgress((s) => {
+      const el = document.getElementById('ftProg');
+      if (!el) return;
+      el.style.display = 'block';
+      el.textContent = `${s.direction === 'upload' ? '正在发送' : '正在下载'}：${s.name} (${s.percent}%)`;
+      if (s.percent >= 100) {
+        setTimeout(() => { if (el) el.style.display = 'none'; }, 1500);
+      }
     });
   }
   await refreshPeers(false);

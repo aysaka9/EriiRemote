@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, Tray, Menu, shell, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, shell, nativeImage, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -95,6 +95,15 @@ function saveAppData(data) {
   const filePath = getDataFilePath();
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
+}
+
+function getShareDir() {
+  const data = loadAppData();
+  const dir = (data.config && data.config.share_dir && data.config.share_dir.trim())
+    ? data.config.share_dir.trim()
+    : path.join(app.getPath('documents'), 'EriiRemote共享');
+  try { fs.mkdirSync(dir, { recursive: true }); } catch {}
+  return dir;
 }
 
 function getAuthToken(cfg) {
@@ -244,7 +253,10 @@ function startControlServer() {
       return sendJson(401, { ok: false, error: 'unauthorized' });
     }
 
-    if (req.method === 'GET' && req.url === '/api/info') {
+    const parsedUrl = new URL(req.url || '/', 'http://127.0.0.1');
+    const pathname = parsedUrl.pathname;
+
+    if (req.method === 'GET' && pathname === '/api/info') {
       const meta = getLocalNetworkMeta();
       return sendJson(200, {
         ok: true,
@@ -255,7 +267,7 @@ function startControlServer() {
       });
     }
 
-    if (req.method === 'GET' && req.url === '/api/version') {
+    if (req.method === 'GET' && pathname === '/api/version') {
       getInstallerInfo().then((inst) => {
         sendJson(200, {
           ok: true,
@@ -266,7 +278,7 @@ function startControlServer() {
       return;
     }
 
-    if (req.method === 'GET' && req.url === '/api/installer') {
+    if (req.method === 'GET' && pathname === '/api/installer') {
       const p = getLocalInstallerPath();
       if (!p) return sendJson(404, { ok: false, error: 'installer not available' });
       const st = fs.statSync(p);
@@ -275,7 +287,91 @@ function startControlServer() {
       return;
     }
 
-    if (req.method === 'POST' && (req.url === '/api/power' || req.url === '/api/wol')) {
+    if (req.method === 'GET' && pathname === '/api/files') {
+      const shareDir = getShareDir();
+      try {
+        const entries = fs.readdirSync(shareDir, { withFileTypes: true });
+        const files = [];
+        for (const ent of entries) {
+          if (!ent.isFile()) continue;
+          const st = fs.statSync(path.join(shareDir, ent.name));
+          files.push({ name: ent.name, size: st.size, mtime: st.mtimeMs });
+        }
+        files.sort((a, b) => b.mtime - a.mtime);
+        return sendJson(200, { ok: true, shareDir, files });
+      } catch (e) {
+        return sendJson(500, { ok: false, error: String(e.message || e) });
+      }
+    }
+
+    if (req.method === 'GET' && pathname === '/api/files/download') {
+      const rawName = parsedUrl.searchParams.get('name') || '';
+      const safeName = path.basename(rawName);
+      const target = path.join(getShareDir(), safeName);
+      if (!safeName || !fs.existsSync(target) || !fs.statSync(target).isFile()) {
+        return sendJson(404, { ok: false, error: 'file not found' });
+      }
+      const st = fs.statSync(target);
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': st.size
+      });
+      fs.createReadStream(target).pipe(res);
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/files/upload') {
+      const rawName = parsedUrl.searchParams.get('name') || `upload_${Date.now()}.bin`;
+      const safeName = path.basename(rawName).trim() || `upload_${Date.now()}.bin`;
+      const dest = path.join(getShareDir(), safeName);
+      const tmp = `${dest}.part`;
+      const out = fs.createWriteStream(tmp);
+      let failed = false;
+      req.on('error', () => {
+        failed = true;
+        out.destroy();
+        try { fs.rmSync(tmp, { force: true }); } catch {}
+      });
+      out.on('error', (e) => {
+        failed = true;
+        try { fs.rmSync(tmp, { force: true }); } catch {}
+        sendJson(500, { ok: false, error: String(e.message || e) });
+      });
+      out.on('finish', () => {
+        if (failed) return;
+        try {
+          fs.renameSync(tmp, dest);
+          sendJson(200, { ok: true, name: safeName });
+        } catch (e) {
+          sendJson(500, { ok: false, error: String(e.message || e) });
+        }
+      });
+      req.pipe(out);
+      return;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/files/delete') {
+      let raw = '';
+      req.on('data', (c) => { if (raw.length < 16384) raw += c; });
+      req.on('end', () => {
+        let body = {};
+        try { body = JSON.parse(raw || '{}'); } catch {}
+        const safeName = path.basename(String(body.name || ''));
+        const target = path.join(getShareDir(), safeName);
+        if (!safeName || !fs.existsSync(target) || !fs.statSync(target).isFile()) {
+          return sendJson(404, { ok: false, error: 'file not found' });
+        }
+        try {
+          fs.unlinkSync(target);
+          return sendJson(200, { ok: true });
+        } catch (e) {
+          return sendJson(500, { ok: false, error: String(e.message || e) });
+        }
+      });
+      return;
+    }
+
+    if (req.method === 'POST' && (pathname === '/api/power' || pathname === '/api/wol')) {
       let raw = '';
       req.on('data', (chunk) => { if (raw.length < 16384) raw += chunk; });
       req.on('end', async () => {
@@ -804,6 +900,7 @@ app.on('second-instance', () => {
 app.whenReady().then(async () => {
   createWindow();
   createTray();
+  getShareDir();
   startControlServer();
   ensureFirewallRule();
   await startEasyTierEngine(false);
@@ -833,6 +930,7 @@ ipcMain.handle('get-app-data', () => {
   const d = loadAppData();
   d.localMac = getLocalNetworkMeta().primaryMac;
   d.appVersion = app.getVersion();
+  d.shareDir = getShareDir();
   return d;
 });
 
@@ -988,6 +1086,164 @@ ipcMain.handle('wake-device', async (_e, { mac, onlinePeerIps }) => {
       ? `已发送唤醒包至 ${clean}（本机 + ${relaySuccess} 台在线节点协同广播）`
       : `已在本机局域网发送唤醒包至 ${clean}`
   };
+});
+
+function uploadSingleFileToPeer(ip, token, filePath) {
+  return new Promise((resolve) => {
+    let st;
+    try { st = fs.statSync(filePath); } catch { return resolve({ ok: false, error: '无法读取文件' }); }
+    const fileName = path.basename(filePath);
+    const req = http.request({
+      hostname: ip,
+      port: CONTROL_PORT,
+      path: `/api/files/upload?name=${encodeURIComponent(fileName)}`,
+      method: 'POST',
+      headers: {
+        'X-Erii-Token': token,
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': st.size
+      }
+    }, (res) => {
+      let raw = '';
+      res.on('data', (c) => { raw += c; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(raw || '{}');
+          resolve({ ok: res.statusCode === 200 && parsed.ok, name: fileName, error: parsed.error });
+        } catch {
+          resolve({ ok: res.statusCode === 200, name: fileName });
+        }
+      });
+    });
+    req.on('error', (e) => resolve({ ok: false, error: String(e.message || e) }));
+    let sent = 0;
+    let lastPct = -1;
+    const rs = fs.createReadStream(filePath);
+    rs.on('data', (chunk) => {
+      sent += chunk.length;
+      if (st.size > 0) {
+        const pct = Math.floor((sent * 100) / st.size);
+        if (pct !== lastPct && (pct % 5 === 0 || pct === 100)) {
+          lastPct = pct;
+          notifyRenderer('file-transfer-progress', { direction: 'upload', name: fileName, percent: pct });
+        }
+      }
+    });
+    rs.on('error', (e) => { req.destroy(); resolve({ ok: false, error: String(e.message || e) }); });
+    rs.pipe(req);
+  });
+}
+
+function downloadSingleFileFromPeer(ip, token, fileName) {
+  return new Promise((resolve) => {
+    const dest = path.join(getShareDir(), path.basename(fileName));
+    const tmp = `${dest}.part`;
+    let settled = false;
+    const finish = (resObj) => {
+      if (settled) return;
+      settled = true;
+      if (!resObj.ok) { try { fs.rmSync(tmp, { force: true }); } catch {} }
+      resolve(resObj);
+    };
+    const req = http.request({
+      hostname: ip,
+      port: CONTROL_PORT,
+      path: `/api/files/download?name=${encodeURIComponent(fileName)}`,
+      method: 'GET',
+      headers: { 'X-Erii-Token': token }
+    }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return finish({ ok: false, error: '下载失败' }); }
+      const total = parseInt(res.headers['content-length'] || '0', 10) || 0;
+      const out = fs.createWriteStream(tmp);
+      let got = 0;
+      let lastPct = -1;
+      res.on('data', (chunk) => {
+        got += chunk.length;
+        if (total > 0) {
+          const pct = Math.floor((got * 100) / total);
+          if (pct !== lastPct && (pct % 5 === 0 || pct === 100)) {
+            lastPct = pct;
+            notifyRenderer('file-transfer-progress', { direction: 'download', name: fileName, percent: pct });
+          }
+        }
+      });
+      res.on('error', (e) => finish({ ok: false, error: String(e.message || e) }));
+      out.on('error', (e) => finish({ ok: false, error: String(e.message || e) }));
+      out.on('finish', () => {
+        out.close(() => {
+          try {
+            fs.renameSync(tmp, dest);
+            finish({ ok: true, localPath: dest });
+          } catch (e) {
+            finish({ ok: false, error: String(e.message || e) });
+          }
+        });
+      });
+      res.pipe(out);
+    });
+    req.on('error', (e) => finish({ ok: false, error: String(e.message || e) }));
+    req.end();
+  });
+}
+
+ipcMain.handle('open-share-dir', () => {
+  const dir = getShareDir();
+  shell.openPath(dir);
+  return { ok: true, dir };
+});
+
+ipcMain.handle('reveal-file', (_e, filePath) => {
+  if (filePath && fs.existsSync(filePath)) shell.showItemInFolder(filePath);
+  return { ok: true };
+});
+
+ipcMain.handle('list-remote-files', async (_e, ip) => {
+  const data = loadAppData();
+  const token = getAuthToken(data.config);
+  if (!token) return { ok: false, error: '请先配置局域网密钥' };
+  const res = await httpJsonRequest(ip, 'GET', '/api/files', null, token, 4000);
+  if (res.status === 200 && res.data && res.data.ok) {
+    return { ok: true, files: res.data.files || [], shareDir: res.data.shareDir || '' };
+  }
+  return { ok: false, error: '无法连接对方文件服务（请确认对方已升级至 v1.3.0+）' };
+});
+
+ipcMain.handle('upload-files-to-peer', async (_e, { ip, filePaths }) => {
+  const data = loadAppData();
+  const token = getAuthToken(data.config);
+  if (!token) return { ok: false, error: '请先配置局域网密钥' };
+
+  let targets = Array.isArray(filePaths) ? filePaths.filter(Boolean) : [];
+  if (targets.length === 0) {
+    const picked = await dialog.showOpenDialog(mainWindow, {
+      title: '选择要发送到对方共享文件夹的文件',
+      properties: ['openFile', 'multiSelections']
+    });
+    if (picked.canceled || !picked.filePaths.length) return { ok: false, canceled: true };
+    targets = picked.filePaths;
+  }
+
+  let successCount = 0;
+  for (const fp of targets) {
+    const r = await uploadSingleFileToPeer(ip, token, fp);
+    if (r.ok) successCount += 1;
+  }
+  return { ok: successCount > 0, count: successCount, total: targets.length };
+});
+
+ipcMain.handle('download-file-from-peer', async (_e, { ip, name }) => {
+  const data = loadAppData();
+  const token = getAuthToken(data.config);
+  if (!token) return { ok: false, error: '请先配置局域网密钥' };
+  return downloadSingleFileFromPeer(ip, token, name);
+});
+
+ipcMain.handle('delete-remote-file', async (_e, { ip, name }) => {
+  const data = loadAppData();
+  const token = getAuthToken(data.config);
+  if (!token) return { ok: false, error: '请先配置局域网密钥' };
+  const res = await httpJsonRequest(ip, 'POST', '/api/files/delete', { name }, token, 3500);
+  return { ok: res.status === 200 && res.data && res.data.ok };
 });
 
 ipcMain.handle('restart-engine', () => startEasyTierEngine(true));
