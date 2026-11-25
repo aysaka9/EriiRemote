@@ -753,20 +753,45 @@ async function probePeerMacIfNeeded(peer, data, token) {
 let inFlightPeerQuery = null;
 let lastGoodPeerState = null;
 let consecutivePeerFailures = 0;
+let skipSlowPeerUntil = 0;
 
-function execCliPeer(cliExe, portalAddr) {
+function runCliJson(cliExe, portalAddr, subcmd, timeoutMs) {
   return new Promise((resolve) => {
-    const args = portalAddr ? ['-p', portalAddr, '-o', 'json', 'peer'] : ['-o', 'json', 'peer'];
-    execFile(cliExe, args, { windowsHide: true, timeout: 6000 }, (err, stdout) => {
+    const args = portalAddr ? ['-p', portalAddr, '-o', 'json', subcmd] : ['-o', 'json', subcmd];
+    execFile(cliExe, args, { windowsHide: true, timeout: timeoutMs }, (err, stdout) => {
       if (err) return resolve({ ok: false });
       try {
         const list = JSON.parse(stdout);
-        return resolve({ ok: true, list });
+        return resolve({ ok: true, list: Array.isArray(list) ? list : [] });
       } catch {
         return resolve({ ok: false });
       }
     });
   });
+}
+
+async function execCliPeer(cliExe, portalAddr) {
+  if (Date.now() > skipSlowPeerUntil) {
+    const peerRes = await runCliJson(cliExe, portalAddr, 'peer', 2500);
+    if (peerRes.ok) return peerRes;
+    // `easytier-cli peer` can hang when a public server RPC stalls; fall back to instant `route`
+    skipSlowPeerUntil = Date.now() + 2 * 60 * 1000;
+  }
+  const routeRes = await runCliJson(cliExe, portalAddr, 'route', 3000);
+  if (!routeRes.ok) return { ok: false };
+  const mapped = routeRes.list.map((r) => ({
+    ipv4: String(r.ipv4 || '').split('/')[0].trim(),
+    hostname: r.hostname || '',
+    cost: r.next_hop_hostname === 'Local'
+      ? 'Local'
+      : (r.next_hop_ipv4 === 'DIRECT' ? 'p2p' : `relay(${r.path_len || 2})`),
+    lat_ms: r.next_hop_lat !== undefined && r.next_hop_lat !== null ? String(r.next_hop_lat) : '-',
+    nat_type: '-',
+    tunnel_proto: r.next_hop_ipv4 === 'DIRECT' ? 'p2p' : 'relay',
+    rx_bytes: '-',
+    tx_bytes: '-'
+  }));
+  return { ok: true, list: mapped };
 }
 
 function queryPeers() {
