@@ -583,6 +583,12 @@ function ensureFirewallRule() {
   });
 }
 
+// Enable WDDM graphics display driver for RDP ("Use WDDM graphics display driver for Remote Desktop Connections")
+function ensureRdpWddmPolicy() {
+  const key = 'HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\Terminal Services';
+  execFile('reg', ['add', key, '/v', 'fEnableWddmDriver', '/t', 'REG_DWORD', '/d', '1', '/f'], { windowsHide: true }, () => {});
+}
+
 function checkExternalEasyTier() {
   return new Promise((resolve) => {
     execFile('tasklist', ['/FI', 'IMAGENAME eq easytier-core.exe', '/NH'], { windowsHide: true }, (err, stdout) => {
@@ -903,6 +909,7 @@ app.whenReady().then(async () => {
   getShareDir();
   startControlServer();
   ensureFirewallRule();
+  ensureRdpWddmPolicy();
   await startEasyTierEngine(false);
 });
 
