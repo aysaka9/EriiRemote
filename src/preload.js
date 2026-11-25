@@ -16,5 +16,6 @@ contextBridge.exposeInMainWorld('eriiApi', {
   pingDevice: (ip) => ipcRenderer.invoke('ping-device', ip),
   remotePower: (ip, action) => ipcRenderer.invoke('remote-power', { ip, action }),
   wakeDevice: (mac, onlinePeerIps) => ipcRenderer.invoke('wake-device', { mac, onlinePeerIps }),
-  restartEngine: () => ipcRenderer.invoke('restart-engine')
+  restartEngine: () => ipcRenderer.invoke('restart-engine'),
+  onUpdateStatus: (cb) => ipcRenderer.on('update-status', (_e, s) => cb(s))
 });

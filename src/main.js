@@ -255,6 +255,26 @@ function startControlServer() {
       });
     }
 
+    if (req.method === 'GET' && req.url === '/api/version') {
+      getInstallerInfo().then((inst) => {
+        sendJson(200, {
+          ok: true,
+          version: app.getVersion(),
+          installer: inst ? { sha256: inst.sha256, size: inst.size } : null
+        });
+      });
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/api/installer') {
+      const p = getLocalInstallerPath();
+      if (!p) return sendJson(404, { ok: false, error: 'installer not available' });
+      const st = fs.statSync(p);
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': st.size });
+      fs.createReadStream(p).pipe(res);
+      return;
+    }
+
     if (req.method === 'POST' && (req.url === '/api/power' || req.url === '/api/wol')) {
       let raw = '';
       req.on('data', (chunk) => { if (raw.length < 16384) raw += chunk; });
@@ -304,6 +324,167 @@ function startControlServer() {
     // Port may already be in use; ignore non-fatally
   });
   controlServer.listen(CONTROL_PORT, '0.0.0.0');
+}
+
+// ===================== LAN peer-to-peer auto update =====================
+let updateInProgress = false;
+let installerHashCache = null;
+const peerVersionCheckedAt = new Map();
+
+function getLocalInstallerPath() {
+  if (!app.isPackaged) return null;
+  const p = path.join(path.dirname(process.execPath), 'update', 'EriiRemote-Setup.exe');
+  return fs.existsSync(p) ? p : null;
+}
+
+function getInstallerInfo() {
+  return new Promise((resolve) => {
+    const p = getLocalInstallerPath();
+    if (!p) return resolve(null);
+    let st;
+    try { st = fs.statSync(p); } catch { return resolve(null); }
+    if (installerHashCache && installerHashCache.path === p &&
+      installerHashCache.mtimeMs === st.mtimeMs && installerHashCache.size === st.size) {
+      return resolve(installerHashCache);
+    }
+    const hash = crypto.createHash('sha256');
+    fs.createReadStream(p)
+      .on('data', (c) => hash.update(c))
+      .on('error', () => resolve(null))
+      .on('end', () => {
+        installerHashCache = { path: p, mtimeMs: st.mtimeMs, size: st.size, sha256: hash.digest('hex') };
+        resolve(installerHashCache);
+      });
+  });
+}
+
+function compareVersions(a, b) {
+  const pa = String(a || '0').split('.').map((n) => parseInt(n, 10) || 0);
+  const pb = String(b || '0').split('.').map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d !== 0) return d > 0 ? 1 : -1;
+  }
+  return 0;
+}
+
+function notifyRenderer(channel, payload) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send(channel, payload);
+  }
+}
+
+function downloadInstallerFromPeer(ip, token, dest, expectedSha, expectedSize) {
+  return new Promise((resolve) => {
+    const tmp = `${dest}.part`;
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      if (!ok) { try { fs.rmSync(tmp, { force: true }); } catch {} }
+      resolve(ok);
+    };
+    const req = http.request({
+      hostname: ip,
+      port: CONTROL_PORT,
+      path: '/api/installer',
+      method: 'GET',
+      timeout: 30000,
+      headers: { 'X-Erii-Token': token }
+    }, (res) => {
+      if (res.statusCode !== 200) { res.resume(); return finish(false); }
+      const hash = crypto.createHash('sha256');
+      const out = fs.createWriteStream(tmp);
+      let received = 0;
+      let lastPct = -1;
+      res.on('data', (chunk) => {
+        hash.update(chunk);
+        received += chunk.length;
+        if (expectedSize) {
+          const pct = Math.floor((received * 100) / expectedSize);
+          if (pct !== lastPct && pct % 20 === 0) {
+            lastPct = pct;
+            notifyRenderer('update-status', { stage: 'downloading', percent: pct });
+          }
+        }
+      });
+      res.on('error', () => finish(false));
+      out.on('error', () => finish(false));
+      out.on('finish', () => {
+        out.close(() => {
+          if (hash.digest('hex') !== expectedSha) return finish(false);
+          try {
+            fs.renameSync(tmp, dest);
+            finish(true);
+          } catch {
+            finish(false);
+          }
+        });
+      });
+      res.pipe(out);
+    });
+    req.on('timeout', () => { req.destroy(); finish(false); });
+    req.on('error', () => finish(false));
+    req.end();
+  });
+}
+
+async function checkPeerUpdate(peer, token) {
+  if (!token || !peer.ipv4 || updateInProgress) return;
+  const last = peerVersionCheckedAt.get(peer.ipv4) || 0;
+  if (Date.now() - last < 5 * 60 * 1000) return;
+  peerVersionCheckedAt.set(peer.ipv4, Date.now());
+
+  const res = await httpJsonRequest(peer.ipv4, 'GET', '/api/version', null, token, 2500);
+  if (res.status !== 200 || !res.data || !res.data.version) return;
+
+  const key = peer.hostname || peer.ipv4;
+  const latest = loadAppData();
+  if (latest.knownDevices[key] && latest.knownDevices[key].appVersion !== res.data.version) {
+    latest.knownDevices[key].appVersion = res.data.version;
+    saveAppData(latest);
+  }
+
+  if (!app.isPackaged || latest.config.auto_update === false) return;
+  if (compareVersions(res.data.version, app.getVersion()) <= 0) return;
+  const inst = res.data.installer;
+  if (!inst || !inst.sha256) return;
+  if (updateInProgress) return;
+
+  updateInProgress = true;
+  const version = res.data.version;
+  try {
+    notifyRenderer('update-status', { stage: 'found', version, from: key });
+    const dir = path.join(app.getPath('userData'), 'updates');
+    fs.mkdirSync(dir, { recursive: true });
+    const dest = path.join(dir, `EriiRemote-Setup-${version}.exe`);
+    const ok = await downloadInstallerFromPeer(peer.ipv4, token, dest, inst.sha256, inst.size);
+    if (!ok) {
+      notifyRenderer('update-status', { stage: 'failed', version });
+      updateInProgress = false;
+      return;
+    }
+    notifyRenderer('update-status', { stage: 'installing', version });
+    setTimeout(() => {
+      spawn(dest, ['/S', '--force-run'], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+      isQuitting = true;
+      if (easytierProc) { try { easytierProc.kill(); } catch {} }
+      if (controlServer) { try { controlServer.close(); } catch {} }
+      app.quit();
+    }, 3000);
+  } catch {
+    updateInProgress = false;
+  }
+}
+
+function ensureFirewallRule() {
+  execFile('netsh', ['advfirewall', 'firewall', 'show', 'rule', 'name=EriiRemote-Control'], { windowsHide: true }, (err, stdout) => {
+    if (!err && String(stdout).includes('EriiRemote-Control')) return;
+    execFile('netsh', [
+      'advfirewall', 'firewall', 'add', 'rule', 'name=EriiRemote-Control',
+      'dir=in', 'action=allow', 'protocol=TCP', `localport=${CONTROL_PORT}`
+    ], { windowsHide: true }, () => {});
+  });
 }
 
 function checkExternalEasyTier() {
@@ -475,6 +656,7 @@ function queryPeers() {
             data.knownDevices[key].lastSeen = Date.now();
           }
           probePeerMacIfNeeded(p, data, token);
+          checkPeerUpdate(p, token);
         }
         if (dirty) saveAppData(data);
 
@@ -577,6 +759,7 @@ app.whenReady().then(async () => {
   createWindow();
   createTray();
   startControlServer();
+  ensureFirewallRule();
   await startEasyTierEngine(false);
 });
 
@@ -603,6 +786,7 @@ ipcMain.handle('get-peers', () => queryPeers());
 ipcMain.handle('get-app-data', () => {
   const d = loadAppData();
   d.localMac = getLocalNetworkMeta().primaryMac;
+  d.appVersion = app.getVersion();
   return d;
 });
 

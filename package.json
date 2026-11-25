@@ -1,6 +1,6 @@
 {
   "name": "erii-remote",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "description": "EriiRemote - 基于 EasyTier 的开源高颜值异地虚拟局域网与远程桌面控制中心",
   "license": "MIT",
   "main": "src/main.js",
@@ -46,6 +46,7 @@
       "requestedExecutionLevel": "requireAdministrator"
     },
     "nsis": {
+      "include": "build/installer.nsh",
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,

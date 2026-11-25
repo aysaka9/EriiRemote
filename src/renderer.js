@@ -46,6 +46,7 @@ function getAllDeviceModels() {
       displayName: appData.aliases[key] || p.hostname || p.ipv4,
       ipv4: p.ipv4,
       mac: known.mac || '',
+      appVersion: known.appVersion || '',
       online: true,
       cost: p.cost || 'p2p',
       lat: p.lat_ms && p.lat_ms !== '-' ? `${Number(p.lat_ms).toFixed(0)}ms` : '',
@@ -64,6 +65,7 @@ function getAllDeviceModels() {
         displayName: appData.aliases[key] || info.hostname || key,
         ipv4: info.ipv4 || '',
         mac: info.mac || '',
+        appVersion: info.appVersion || '',
         online: false,
         cost: 'offline',
         lat: '',
@@ -233,7 +235,7 @@ function renderDeviceDetail() {
 
     <div class="section-title">
       <span>快速启动</span>
-      <span style="font-size:12px;color:var(--text-muted);font-weight:400;">NAT: ${escapeHtml(dev.nat)} · 协议: ${escapeHtml(dev.tunnel)} · 收/发: ${escapeHtml(dev.rx)} / ${escapeHtml(dev.tx)}</span>
+      <span style="font-size:12px;color:var(--text-muted);font-weight:400;">NAT: ${escapeHtml(dev.nat)} · 协议: ${escapeHtml(dev.tunnel)} · 收/发: ${escapeHtml(dev.rx)} / ${escapeHtml(dev.tx)}${dev.appVersion ? ` · Erii v${escapeHtml(dev.appVersion)}` : ''}</span>
     </div>
     <div class="quick-box ${quickItems.length === 0 ? 'empty' : ''}">
       ${quickItems.map((q, idx) => `
@@ -583,7 +585,7 @@ function renderSettings() {
 
   panel.innerHTML = `
     <div class="dev-top-bar">
-      <h1 class="dev-main-title">软件与局域网设置</h1>
+      <h1 class="dev-main-title">软件与局域网设置 <span style="font-size:13px;color:var(--text-muted);font-weight:500;">v${escapeHtml(appData.appVersion || '')}</span></h1>
       <span class="meta-pill">${modeLabel}</span>
     </div>
     <div class="form-card">
@@ -628,6 +630,13 @@ function renderSettings() {
         <input type="checkbox" id="cfgAllowPower" ${cfg.allow_remote_power !== false ? 'checked' : ''} style="width:18px;height:18px;cursor:pointer;" />
       </div>
       <div class="form-row switch-row">
+        <div>
+          <label style="margin:0;">自动从局域网内同步升级</label>
+          <div class="hint">发现同局域网设备运行更新版本的 Erii 远程时，自动下载校验并静默升级</div>
+        </div>
+        <input type="checkbox" id="cfgAutoUpdate" ${cfg.auto_update !== false ? 'checked' : ''} style="width:18px;height:18px;cursor:pointer;" />
+      </div>
+      <div class="form-row switch-row">
         <label style="margin:0;">开机自动启动 Erii 远程</label>
         <input type="checkbox" id="cfgAutoStart" ${cfg.autoStart ? 'checked' : ''} style="width:18px;height:18px;cursor:pointer;" />
       </div>
@@ -661,6 +670,7 @@ function renderSettings() {
       nas_https_port: Number(document.getElementById('cfgNasHttps').value) || 5667,
       public_peers: document.getElementById('cfgPeers').value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean),
       allow_remote_power: document.getElementById('cfgAllowPower').checked,
+      auto_update: document.getElementById('cfgAutoUpdate').checked,
       autoStart: document.getElementById('cfgAutoStart').checked
     };
     await window.eriiApi.saveConfig(newCfg);
@@ -727,6 +737,14 @@ window.refreshPeers = refreshPeers;
   });
 
   appData = await window.eriiApi.getAppData();
+  if (window.eriiApi.onUpdateStatus) {
+    window.eriiApi.onUpdateStatus((s) => {
+      if (s.stage === 'found') toast(`发现局域网内新版本 v${s.version}（来自 ${s.from}），正在自动同步...`);
+      else if (s.stage === 'downloading') toast(`正在同步新版本... ${s.percent}%`);
+      else if (s.stage === 'installing') toast(`新版本 v${s.version} 校验通过，3 秒后自动静默升级并重启`);
+      else if (s.stage === 'failed') toast('局域网同步升级失败，稍后自动重试');
+    });
+  }
   await refreshPeers(false);
   setInterval(() => refreshPeers(false), 5000);
 })();
