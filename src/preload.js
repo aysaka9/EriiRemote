@@ -17,6 +17,7 @@ contextBridge.exposeInMainWorld('eriiApi', {
   remotePower: (ip, action) => ipcRenderer.invoke('remote-power', { ip, action }),
   wakeDevice: (mac, onlinePeerIps) => ipcRenderer.invoke('wake-device', { mac, onlinePeerIps }),
   restartEngine: () => ipcRenderer.invoke('restart-engine'),
+  checkLanUpdate: () => ipcRenderer.invoke('check-lan-update'),
   onUpdateStatus: (cb) => ipcRenderer.on('update-status', (_e, s) => cb(s)),
   openShareDir: () => ipcRenderer.invoke('open-share-dir'),
   revealFile: (p) => ipcRenderer.invoke('reveal-file', p),

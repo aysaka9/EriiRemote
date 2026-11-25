@@ -762,9 +762,10 @@ function renderSettings() {
         <label style="margin:0;">开机自动启动 Erii 远程</label>
         <input type="checkbox" id="cfgAutoStart" ${cfg.autoStart ? 'checked' : ''} style="width:18px;height:18px;cursor:pointer;" />
       </div>
-      <div style="display:flex;gap:10px;margin-top:18px;">
+      <div style="display:flex;gap:10px;margin-top:18px;flex-wrap:wrap;">
         <button class="btn-primary" id="btnSaveCfg">保存并连接</button>
         <button class="btn-sec" id="btnRestartEngine">重启组网引擎</button>
+        <button class="btn-sec" id="btnCheckUpdate">🔄 检查局域网更新</button>
       </div>
     </div>
   `;
@@ -815,6 +816,12 @@ function renderSettings() {
     await window.eriiApi.restartEngine();
     toast('已触发引擎重连');
     setTimeout(() => refreshPeers(false), 1800);
+  });
+
+  document.getElementById('btnCheckUpdate').addEventListener('click', async () => {
+    toast('正在检查局域网内设备版本...');
+    const res = await window.eriiApi.checkLanUpdate();
+    if (res && !res.updating) toast(res.message || res.error || '当前已是最新版本');
   });
 }
 

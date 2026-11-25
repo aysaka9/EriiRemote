@@ -485,7 +485,7 @@ function downloadInstallerFromPeer(ip, token, dest, expectedSha, expectedSize) {
       port: CONTROL_PORT,
       path: '/api/installer',
       method: 'GET',
-      timeout: 30000,
+      timeout: 120000,
       headers: { 'X-Erii-Token': token }
     }, (res) => {
       if (res.statusCode !== 200) { res.resume(); return finish(false); }
@@ -525,14 +525,14 @@ function downloadInstallerFromPeer(ip, token, dest, expectedSha, expectedSize) {
   });
 }
 
-async function checkPeerUpdate(peer, token) {
-  if (!token || !peer.ipv4 || updateInProgress) return;
+async function checkPeerUpdate(peer, token, force = false) {
+  if (!token || !peer.ipv4 || updateInProgress) return false;
   const last = peerVersionCheckedAt.get(peer.ipv4) || 0;
-  if (Date.now() - last < 5 * 60 * 1000) return;
+  if (!force && Date.now() - last < 60 * 1000) return false;
   peerVersionCheckedAt.set(peer.ipv4, Date.now());
 
   const res = await httpJsonRequest(peer.ipv4, 'GET', '/api/version', null, token, 2500);
-  if (res.status !== 200 || !res.data || !res.data.version) return;
+  if (res.status !== 200 || !res.data || !res.data.version) return false;
 
   const key = peer.hostname || peer.ipv4;
   const latest = loadAppData();
@@ -541,11 +541,11 @@ async function checkPeerUpdate(peer, token) {
     saveAppData(latest);
   }
 
-  if (!app.isPackaged || latest.config.auto_update === false) return;
-  if (compareVersions(res.data.version, app.getVersion()) <= 0) return;
+  if (!app.isPackaged || (!force && latest.config.auto_update === false)) return false;
+  if (compareVersions(res.data.version, app.getVersion()) <= 0) return false;
   const inst = res.data.installer;
-  if (!inst || !inst.sha256) return;
-  if (updateInProgress) return;
+  if (!inst || !inst.sha256) return false;
+  if (updateInProgress) return false;
 
   updateInProgress = true;
   const version = res.data.version;
@@ -558,18 +558,24 @@ async function checkPeerUpdate(peer, token) {
     if (!ok) {
       notifyRenderer('update-status', { stage: 'failed', version });
       updateInProgress = false;
-      return;
+      return false;
     }
     notifyRenderer('update-status', { stage: 'installing', version });
-    setTimeout(() => {
-      spawn(dest, ['/S', '--force-run'], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    setTimeout(async () => {
+      // Wait 2s in a detached cmd wrapper so EriiRemote.exe and easytier-core.exe fully exit and unlock files before silent NSIS runs
+      const cmd = `ping -n 3 127.0.0.1 >nul && start "" "${dest}" /S --force-run`;
+      spawn('cmd.exe', ['/c', cmd], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
       isQuitting = true;
-      if (easytierProc) { try { easytierProc.kill(); } catch {} }
+      if (easytierProc && easytierProc.pid) {
+        await killProcessSync(easytierProc.pid);
+      }
       if (controlServer) { try { controlServer.close(); } catch {} }
-      app.quit();
-    }, 3000);
+      app.exit(0);
+    }, 1500);
+    return true;
   } catch {
     updateInProgress = false;
+    return false;
   }
 }
 
@@ -1294,6 +1300,26 @@ ipcMain.handle('delete-remote-file', async (_e, { ip, name }) => {
   if (!token) return { ok: false, error: '请先配置局域网密钥' };
   const res = await httpJsonRequest(ip, 'POST', '/api/files/delete', { name }, token, 3500);
   return { ok: res.status === 200 && res.data && res.data.ok };
+});
+
+ipcMain.handle('check-lan-update', async () => {
+  const data = loadAppData();
+  const token = getAuthToken(data.config);
+  if (!token) return { ok: false, error: '请先配置局域网密钥' };
+  const status = await new Promise((resolve) => {
+    const cliExe = getResourcePath('easytier', 'easytier-cli.exe');
+    execFile(cliExe, ['-o', 'json', 'peer'], { windowsHide: true, timeout: 4000 }, (err, stdout) => {
+      if (err) return resolve([]);
+      try {
+        resolve(JSON.parse(stdout).filter((x) => x.cost !== 'Local' && x.ipv4));
+      } catch { resolve([]); }
+    });
+  });
+  for (const p of status) {
+    const started = await checkPeerUpdate(p, token, true);
+    if (started) return { ok: true, updating: true };
+  }
+  return { ok: true, updating: false, message: '当前已是局域网内最新版本' };
 });
 
 ipcMain.handle('restart-engine', () => startEasyTierEngine(true));
