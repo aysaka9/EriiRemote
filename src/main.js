@@ -683,6 +683,7 @@ async function startEasyTierEngine(forceRestart = false) {
   }
 
   const args = [
+    '-r', '127.0.0.1:25888',
     '--network-name', cfg.network_name.trim(),
     '--network-secret', cfg.network_secret.trim(),
     '--hostname', (cfg.hostname || os.hostname()).trim(),
@@ -749,26 +750,61 @@ async function probePeerMacIfNeeded(peer, data, token) {
   }
 }
 
-function queryPeers() {
+let inFlightPeerQuery = null;
+let lastGoodPeerState = null;
+let consecutivePeerFailures = 0;
+
+function execCliPeer(cliExe, portalAddr) {
   return new Promise((resolve) => {
-    if (engineMode === 'unconfigured') {
-      return resolve({
-        ok: false,
-        error: '待配置局域网密钥',
-        peers: [],
-        relays: [],
-        local: null,
-        engineMode,
-        engineLastError
-      });
-    }
-    const cliExe = getResourcePath('easytier', 'easytier-cli.exe');
-    if (!fs.existsSync(cliExe)) {
-      return resolve({ ok: false, error: '未找到 easytier-cli.exe', peers: [], relays: [], local: null, engineMode });
-    }
-    execFile(cliExe, ['-o', 'json', 'peer'], { windowsHide: true, timeout: 4000 }, (err, stdout) => {
-      if (err) {
-        return resolve({
+    const args = portalAddr ? ['-p', portalAddr, '-o', 'json', 'peer'] : ['-o', 'json', 'peer'];
+    execFile(cliExe, args, { windowsHide: true, timeout: 6000 }, (err, stdout) => {
+      if (err) return resolve({ ok: false });
+      try {
+        const list = JSON.parse(stdout);
+        return resolve({ ok: true, list });
+      } catch {
+        return resolve({ ok: false });
+      }
+    });
+  });
+}
+
+function queryPeers() {
+  if (inFlightPeerQuery) return inFlightPeerQuery;
+  inFlightPeerQuery = (async () => {
+    try {
+      if (engineMode === 'unconfigured') {
+        lastGoodPeerState = null;
+        return {
+          ok: false,
+          error: '待配置局域网密钥',
+          peers: [],
+          relays: [],
+          local: null,
+          engineMode,
+          engineLastError
+        };
+      }
+      const cliExe = getResourcePath('easytier', 'easytier-cli.exe');
+      if (!fs.existsSync(cliExe)) {
+        return { ok: false, error: '未找到 easytier-cli.exe', peers: [], relays: [], local: null, engineMode };
+      }
+
+      const portals = engineMode === 'builtin'
+        ? ['127.0.0.1:25888', '127.0.0.1:15888']
+        : ['127.0.0.1:15888', '127.0.0.1:25888'];
+
+      let cliRes = await execCliPeer(cliExe, portals[0]);
+      if (!cliRes.ok) {
+        cliRes = await execCliPeer(cliExe, portals[1]);
+      }
+
+      if (!cliRes.ok) {
+        consecutivePeerFailures += 1;
+        if (lastGoodPeerState && consecutivePeerFailures < 3) {
+          return { ...lastGoodPeerState, engineMode, engineLastError };
+        }
+        return {
           ok: false,
           error: '正在连接异地局域网...',
           peers: [],
@@ -776,58 +812,61 @@ function queryPeers() {
           local: null,
           engineMode,
           engineLastError
-        });
+        };
       }
-      try {
-        const list = JSON.parse(stdout);
-        let local = null;
-        const peers = [];
-        const relays = [];
-        for (const item of list) {
-          if (item.cost === 'Local') {
-            local = item;
-          } else if (item.ipv4 && item.ipv4.trim() !== '') {
-            peers.push(item);
-          } else {
-            relays.push(item);
-          }
-        }
-        const data = loadAppData();
-        const token = getAuthToken(data.config);
-        let dirty = false;
-        for (const p of peers) {
-          const key = p.hostname || p.ipv4;
-          const existing = data.knownDevices[key];
-          if (!existing || existing.ipv4 !== p.ipv4) {
-            data.knownDevices[key] = {
-              ...(existing || {}),
-              hostname: p.hostname,
-              ipv4: p.ipv4,
-              lastSeen: Date.now()
-            };
-            dirty = true;
-          } else {
-            data.knownDevices[key].lastSeen = Date.now();
-          }
-          probePeerMacIfNeeded(p, data, token);
-          checkPeerUpdate(p, token);
-        }
-        if (dirty) saveAppData(data);
 
-        resolve({
-          ok: true,
-          local,
-          peers,
-          relays,
-          knownDevices: data.knownDevices,
-          engineMode,
-          engineLastError
-        });
-      } catch {
-        resolve({ ok: false, error: '解析节点信息失败', peers: [], relays: [], local: null, engineMode });
+      consecutivePeerFailures = 0;
+      const list = cliRes.list;
+      let local = null;
+      const peers = [];
+      const relays = [];
+      for (const item of list) {
+        if (item.cost === 'Local') {
+          local = item;
+        } else if (item.ipv4 && item.ipv4.trim() !== '') {
+          peers.push(item);
+        } else {
+          relays.push(item);
+        }
       }
-    });
-  });
+      const data = loadAppData();
+      const token = getAuthToken(data.config);
+      let dirty = false;
+      for (const p of peers) {
+        const key = p.hostname || p.ipv4;
+        const existing = data.knownDevices[key];
+        if (!existing || existing.ipv4 !== p.ipv4) {
+          data.knownDevices[key] = {
+            ...(existing || {}),
+            hostname: p.hostname,
+            ipv4: p.ipv4,
+            lastSeen: Date.now()
+          };
+          dirty = true;
+        } else {
+          data.knownDevices[key].lastSeen = Date.now();
+        }
+        probePeerMacIfNeeded(p, data, token);
+        checkPeerUpdate(p, token);
+      }
+      if (dirty) saveAppData(data);
+
+      const state = {
+        ok: true,
+        local,
+        peers,
+        relays,
+        knownDevices: data.knownDevices,
+        engineMode,
+        engineLastError
+      };
+      lastGoodPeerState = state;
+      return state;
+    } finally {
+      inFlightPeerQuery = null;
+    }
+  })();
+  return inFlightPeerQuery;
 }
 
 function findMoonlightExe() {
@@ -1312,16 +1351,9 @@ ipcMain.handle('check-lan-update', async () => {
   const data = loadAppData();
   const token = getAuthToken(data.config);
   if (!token) return { ok: false, error: '请先配置局域网密钥' };
-  const status = await new Promise((resolve) => {
-    const cliExe = getResourcePath('easytier', 'easytier-cli.exe');
-    execFile(cliExe, ['-o', 'json', 'peer'], { windowsHide: true, timeout: 4000 }, (err, stdout) => {
-      if (err) return resolve([]);
-      try {
-        resolve(JSON.parse(stdout).filter((x) => x.cost !== 'Local' && x.ipv4));
-      } catch { resolve([]); }
-    });
-  });
-  for (const p of status) {
+  const q = await queryPeers();
+  const peers = (q && q.peers) || [];
+  for (const p of peers) {
     const started = await checkPeerUpdate(p, token, true);
     if (started) return { ok: true, updating: true };
   }
