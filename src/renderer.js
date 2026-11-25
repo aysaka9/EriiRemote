@@ -753,10 +753,10 @@ function renderSettings() {
       </div>
       <div class="form-row switch-row">
         <div>
-          <label style="margin:0;">自动从局域网内同步升级</label>
-          <div class="hint">发现同局域网设备运行更新版本的 Erii 远程时，自动下载校验并静默升级</div>
+          <label style="margin:0;">无人值守自动静默升级（默认关闭，推荐手动点击升级更安全）</label>
+          <div class="hint">开启后发现局域网新版本将自动下载并重启安装；关闭时仅提示，可随时点下方按钮一键升级</div>
         </div>
-        <input type="checkbox" id="cfgAutoUpdate" ${cfg.auto_update !== false ? 'checked' : ''} style="width:18px;height:18px;cursor:pointer;" />
+        <input type="checkbox" id="cfgAutoUpdate" ${cfg.auto_update === true ? 'checked' : ''} style="width:18px;height:18px;cursor:pointer;" />
       </div>
       <div class="form-row switch-row">
         <label style="margin:0;">开机自动启动 Erii 远程</label>
@@ -889,11 +889,16 @@ window.refreshPeers = refreshPeers;
 
   appData = await window.eriiApi.getAppData();
   if (window.eriiApi.onUpdateStatus) {
+    let notifiedVer = '';
     window.eriiApi.onUpdateStatus((s) => {
-      if (s.stage === 'found') toast(`发现局域网内新版本 v${s.version}（来自 ${s.from}），正在自动同步...`);
+      if (s.stage === 'available' && notifiedVer !== s.version) {
+        notifiedVer = s.version;
+        toast(`发现局域网新版本 v${s.version}（来自 ${s.from}），可到「设置 → 检查局域网更新」一键升级`);
+      }
+      else if (s.stage === 'found') toast(`正在从 ${s.from} 同步新版本 v${s.version}...`);
       else if (s.stage === 'downloading') toast(`正在同步新版本... ${s.percent}%`);
-      else if (s.stage === 'installing') toast(`新版本 v${s.version} 校验通过，3 秒后自动静默升级并重启`);
-      else if (s.stage === 'failed') toast('局域网同步升级失败，稍后自动重试');
+      else if (s.stage === 'installing') toast(`新版本 v${s.version} 校验通过，即将静默升级并重启`);
+      else if (s.stage === 'failed') toast('局域网同步升级失败，请检查日志');
     });
   }
   if (window.eriiApi.onFileTransferProgress) {

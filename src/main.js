@@ -544,26 +544,61 @@ function downloadInstallerFromPeer(ip, token, dest, expectedSha, expectedSize) {
   });
 }
 
-async function checkPeerUpdate(peer, token, force = false) {
-  if (!token || !peer.ipv4 || updateInProgress) return false;
-  const last = peerVersionCheckedAt.get(peer.ipv4) || 0;
-  if (!force && Date.now() - last < 60 * 1000) return false;
-  peerVersionCheckedAt.set(peer.ipv4, Date.now());
+let lastBatchUpdateCheckAt = 0;
 
-  const res = await httpJsonRequest(peer.ipv4, 'GET', '/api/version', null, token, 2500);
-  if (res.status !== 200 || !res.data || !res.data.version) return false;
+async function findHighestPeerUpdate(peers, token) {
+  const validPeers = (peers || []).filter((p) => p && p.ipv4);
+  if (!token || !validPeers.length) return null;
 
+  const probed = await Promise.all(validPeers.map(async (p) => {
+    const res = await httpJsonRequest(p.ipv4, 'GET', '/api/version', null, token, 2500);
+    if (res.status !== 200 || !res.data || !res.data.version) return null;
+    return { peer: p, data: res.data };
+  }));
+
+  const latest = loadAppData();
+  let dirty = false;
+  let best = null;
+  for (const item of probed) {
+    if (!item) continue;
+    const key = item.peer.hostname || item.peer.ipv4;
+    if (latest.knownDevices[key] && latest.knownDevices[key].appVersion !== item.data.version) {
+      latest.knownDevices[key].appVersion = item.data.version;
+      dirty = true;
+    }
+    const inst = item.data.installer;
+    if (!inst || !inst.sha256) continue;
+    if (compareVersions(item.data.version, app.getVersion()) <= 0) continue;
+    if (!best || compareVersions(item.data.version, best.data.version) > 0) {
+      best = item;
+    }
+  }
+  if (dirty) saveAppData(latest);
+  return best;
+}
+
+async function checkAllPeersUpdate(peers, token, force = false) {
+  if (!token || updateInProgress) return false;
+  if (!force && Date.now() - lastBatchUpdateCheckAt < 60 * 1000) return false;
+  lastBatchUpdateCheckAt = Date.now();
+
+  const best = await findHighestPeerUpdate(peers, token);
+  if (!best) return false;
+
+  const peer = best.peer;
+  const res = { status: 200, data: best.data };
   const key = peer.hostname || peer.ipv4;
   const latest = loadAppData();
-  if (latest.knownDevices[key] && latest.knownDevices[key].appVersion !== res.data.version) {
-    latest.knownDevices[key].appVersion = res.data.version;
-    saveAppData(latest);
-  }
 
-  if (!app.isPackaged || (!force && latest.config.auto_update === false)) return false;
-  if (compareVersions(res.data.version, app.getVersion()) <= 0) return false;
+  if (!app.isPackaged) return false;
   const inst = res.data.installer;
-  if (!inst || !inst.sha256) return false;
+
+  // By default only notify the user instead of killing a remote machine unattended.
+  // Automatic unattended upgrade only runs if user explicitly enabled `auto_update: true`, or clicked manual check (`force: true`).
+  if (!force && latest.config.auto_update !== true) {
+    notifyRenderer('update-status', { stage: 'available', version: res.data.version, from: key });
+    return false;
+  }
   if (updateInProgress) return false;
 
   updateInProgress = true;
@@ -584,17 +619,22 @@ async function checkPeerUpdate(peer, token, force = false) {
     writeLog('INFO', `Downloaded & verified v${version}, launching silent installer...`);
     notifyRenderer('update-status', { stage: 'installing', version });
     setTimeout(async () => {
-      // Write a UTF-8 batch updater (with chcp 65001 for Chinese exe name) so Node never mangles cmd quotes,
-      // wait for silent NSIS (/S) to finish, then relaunch Erii远程.exe cleanly.
       const batPath = path.join(dir, 'run-update.bat');
+      const updLog = path.join(app.getPath('userData'), 'logs', 'updater.log');
       const batContent = [
         '@echo off',
         'chcp 65001 >nul',
+        `echo [%date% %time%] Updater started >> "${updLog}"`,
         'ping -n 3 127.0.0.1 >nul',
-        '"%~1" /S',
+        `echo [%date% %time%] Running silent installer: "%~1" >> "${updLog}"`,
+        'start "" /wait "%~1" /S',
+        `echo [%date% %time%] Installer finished with exit code %errorlevel% >> "${updLog}"`,
+        'ping -n 2 127.0.0.1 >nul',
         'if exist "%~2" (',
+        `  echo [%date% %time%] Relaunching "%~2" >> "${updLog}"`,
         '  start "" "%~2"',
         ') else if exist "%ProgramFiles%\\Erii远程\\Erii远程.exe" (',
+        `  echo [%date% %time%] Relaunching ProgramFiles exe >> "${updLog}"`,
         '  start "" "%ProgramFiles%\\Erii远程\\Erii远程.exe"',
         ')',
         'del "%~f0"'
@@ -742,9 +782,11 @@ async function startEasyTierEngine(forceRestart = false) {
 
   try {
     engineLastError = '';
+    // CRITICAL: ignore stdout so the 64KB Windows pipe buffer NEVER fills up and deadlocks easytier-core's RPC server!
     const proc = spawn(coreExe, args, {
       cwd: path.dirname(coreExe),
-      windowsHide: true
+      windowsHide: true,
+      stdio: ['ignore', 'ignore', 'pipe']
     });
     easytierProc = proc;
     engineMode = 'builtin';
@@ -920,9 +962,9 @@ function queryPeers() {
           data.knownDevices[key].lastSeen = Date.now();
         }
         probePeerMacIfNeeded(p, data, token);
-        checkPeerUpdate(p, token);
       }
       if (dirty) saveAppData(data);
+      checkAllPeersUpdate(peers, token, false);
 
       const state = {
         ok: true,
@@ -1428,10 +1470,8 @@ ipcMain.handle('check-lan-update', async () => {
   if (!token) return { ok: false, error: '请先配置局域网密钥' };
   const q = await queryPeers();
   const peers = (q && q.peers) || [];
-  for (const p of peers) {
-    const started = await checkPeerUpdate(p, token, true);
-    if (started) return { ok: true, updating: true };
-  }
+  const started = await checkAllPeersUpdate(peers, token, true);
+  if (started) return { ok: true, updating: true };
   return { ok: true, updating: false, message: '当前已是局域网内最新版本' };
 });
 
