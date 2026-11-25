@@ -856,7 +856,8 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      backgroundThrottling: false
     }
   });
 
@@ -917,6 +918,11 @@ app.whenReady().then(async () => {
   ensureFirewallRule();
   ensureRdpWddmPolicy();
   await startEasyTierEngine(false);
+  // Run peer discovery & auto-update check independently in main process every 60s
+  // so tray-minimized instances never get throttled by Chromium.
+  setInterval(() => {
+    queryPeers().catch(() => {});
+  }, 60 * 1000);
 });
 
 app.on('before-quit', () => {
