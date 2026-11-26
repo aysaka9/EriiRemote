@@ -760,6 +760,16 @@ function renderSettings() {
       </div>
       <div class="form-row switch-row">
         <div>
+          <label style="margin:0;">现代版远程桌面客户端（窗口拖拽动态重设分辨率）</label>
+          <div class="hint">${appData.msrdcReady
+            ? '✅ 已安装 Microsoft Remote Desktop (msrdc.exe)，窗口调整大小自动重设远端分辨率'
+            : (appData.msrdcState === 'installing'
+              ? '⏳ 正在后台自动下载安装 Microsoft Remote Desktop，安装完成后自动切换'
+              : '未检测到现代版客户端（当前回退使用系统 mstsc 智能缩放）')}</div>
+        </div>
+      </div>
+      <div class="form-row switch-row">
+        <div>
           <label style="margin:0;">本机共享文件夹（互传文件默认目录）</label>
           <div class="hint"><code>${escapeHtml(appData.shareDir || '文档\\EriiRemote共享')}</code></div>
         </div>
@@ -913,6 +923,12 @@ window.refreshPeers = refreshPeers;
       else if (s.stage === 'downloading') toast(`正在同步新版本... ${s.percent}%`);
       else if (s.stage === 'installing') toast(`新版本 v${s.version} 校验通过，即将静默升级并重启`);
       else if (s.stage === 'failed') toast('局域网同步升级失败，请检查日志');
+      else if (s.stage === 'msrdc-installing') toast('正在后台自动安装微软现代版远程桌面（支持窗口动态分辨率）...');
+      else if (s.stage === 'msrdc-ready') {
+        appData.msrdcReady = true;
+        appData.msrdcState = 'installed';
+        toast('✅ 微软现代版远程桌面已自动安装就绪，窗口缩放现已支持动态分辨率！');
+      }
     });
   }
   if (window.eriiApi.onFileTransferProgress) {

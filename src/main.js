@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const http = require('http');
+const https = require('https');
 const dgram = require('dgram');
 const crypto = require('crypto');
 const { spawn, execFile } = require('child_process');
@@ -1106,6 +1107,7 @@ app.whenReady().then(async () => {
   startControlServer();
   ensureFirewallRule();
   ensureRdpWddmPolicy();
+  ensureMsrdcInstalled().catch(() => {});
   await startEasyTierEngine(false);
   // Run peer discovery & auto-update check independently in main process every 60s
   // so tray-minimized instances never get throttled by Chromium.
@@ -1140,6 +1142,8 @@ ipcMain.handle('get-app-data', () => {
   d.appVersion = app.getVersion();
   d.shareDir = getShareDir();
   d.logFile = getLogFilePath();
+  d.msrdcReady = Boolean(findMsrdcExe());
+  d.msrdcState = d.msrdcReady ? 'installed' : msrdcInstallState;
   return d;
 });
 
@@ -1162,11 +1166,126 @@ ipcMain.handle('save-meta', (_e, patch) => {
   return { ok: true };
 });
 
-// Ensure mstsc's Default.rdp enables dynamic resolution (remote resolution follows window resize)
+// ===================== Microsoft Modern Remote Desktop (msrdc.exe) =====================
+const MSRDC_MSI_URL = 'https://go.microsoft.com/fwlink/?linkid=2139369';
+let msrdcInstallState = 'unknown'; // 'installed' | 'installing' | 'failed' | 'unknown'
+
+function findMsrdcExe() {
+  const candidates = [
+    path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Remote Desktop', 'msrdc.exe'),
+    path.join(process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)', 'Remote Desktop', 'msrdc.exe'),
+    path.join(process.env.LOCALAPPDATA || '', 'Apps', 'Remote Desktop', 'msrdc.exe')
+  ];
+  for (const p of candidates) {
+    if (p && fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
+function downloadFileWithRedirect(urlStr, destPath, redirectsLeft = 6) {
+  return new Promise((resolve) => {
+    const mod = urlStr.startsWith('https:') ? https : http;
+    const req = mod.get(urlStr, { timeout: 60000 }, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location && redirectsLeft > 0) {
+        res.resume();
+        const nextUrl = new URL(res.headers.location, urlStr).toString();
+        return downloadFileWithRedirect(nextUrl, destPath, redirectsLeft - 1).then(resolve);
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return resolve({ ok: false, error: `HTTP ${res.statusCode}` });
+      }
+      const tmp = `${destPath}.part`;
+      const out = fs.createWriteStream(tmp);
+      res.on('error', (e) => { out.destroy(); resolve({ ok: false, error: String(e.message || e) }); });
+      out.on('error', (e) => resolve({ ok: false, error: String(e.message || e) }));
+      out.on('finish', () => {
+        out.close(() => {
+          try {
+            fs.renameSync(tmp, destPath);
+            resolve({ ok: true });
+          } catch (e) {
+            resolve({ ok: false, error: String(e.message || e) });
+          }
+        });
+      });
+      res.pipe(out);
+    });
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: 'timeout' }); });
+    req.on('error', (e) => resolve({ ok: false, error: String(e.message || e) }));
+  });
+}
+
+async function ensureMsrdcInstalled() {
+  if (findMsrdcExe()) {
+    msrdcInstallState = 'installed';
+    return { ok: true, state: 'installed' };
+  }
+  if (msrdcInstallState === 'installing') {
+    return { ok: false, state: 'installing' };
+  }
+  msrdcInstallState = 'installing';
+  writeLog('INFO', 'Microsoft Remote Desktop (msrdc.exe) not found, downloading official MSI in background...');
+  notifyRenderer('update-status', { stage: 'msrdc-installing' });
+  try {
+    const dir = path.join(app.getPath('userData'), 'updates');
+    fs.mkdirSync(dir, { recursive: true });
+    const msiPath = path.join(dir, 'RemoteDesktop_x64.msi');
+    const dl = await downloadFileWithRedirect(MSRDC_MSI_URL, msiPath);
+    if (!dl.ok) {
+      msrdcInstallState = 'failed';
+      writeLog('WARN', `Failed to download MSRDC MSI: ${dl.error}`);
+      return { ok: false, state: 'failed', error: dl.error };
+    }
+    writeLog('INFO', `Downloaded MSRDC MSI (${msiPath}), installing silently...`);
+    const exitCode = await new Promise((resolve) => {
+      execFile('msiexec.exe', ['/i', msiPath, '/qn', '/norestart', 'ALLUSERS=1'], { windowsHide: true, timeout: 180000 }, (err) => {
+        resolve(err ? (err.code || 1) : 0);
+      });
+    });
+    try { fs.rmSync(msiPath, { force: true }); } catch {}
+    if (findMsrdcExe()) {
+      msrdcInstallState = 'installed';
+      writeLog('INFO', `MSRDC installed successfully (exit=${exitCode})`);
+      notifyRenderer('update-status', { stage: 'msrdc-ready' });
+      return { ok: true, state: 'installed' };
+    }
+    msrdcInstallState = 'failed';
+    writeLog('WARN', `MSRDC install finished (exit=${exitCode}) but msrdc.exe not found`);
+    return { ok: false, state: 'failed' };
+  } catch (e) {
+    msrdcInstallState = 'failed';
+    writeLog('ERROR', `MSRDC auto-install exception: ${e.message || e}`);
+    return { ok: false, state: 'failed', error: String(e.message || e) };
+  }
+}
+
+function writeMsrdcRdpFile(target) {
+  const rdpDir = path.join(app.getPath('userData'), 'rdp');
+  fs.mkdirSync(rdpDir, { recursive: true });
+  const safeName = String(target || 'default').replace(/[^a-zA-Z0-9._-]/g, '_');
+  const filePath = path.join(rdpDir, `${safeName}.rdp`);
+  const content = [
+    `full address:s:${target}`,
+    'screen mode id:i:1',
+    'dynamic resolution:i:1',
+    'smart sizing:i:0',
+    'desktopwidth:i:1600',
+    'desktopheight:i:900',
+    'redirectclipboard:i:1',
+    'use multimon:i:0',
+    'authentication level:i:2',
+    'prompt for credentials on client:i:1'
+  ].join('\r\n') + '\r\n';
+  fs.writeFileSync(filePath, content, 'utf8');
+  return filePath;
+}
+
+// Ensure mstsc's Default.rdp enables smart sizing as fallback when msrdc.exe is not installed yet
 function ensureRdpDynamicResolution() {
   try {
     const p = path.join(app.getPath('documents'), 'Default.rdp');
-    const wanted = { 'dynamic resolution': 'i:1', 'smart sizing': 'i:0' };
+    const wanted = { 'dynamic resolution': 'i:1', 'smart sizing': 'i:1' };
     let text = '';
     const exists = fs.existsSync(p);
     if (exists) {
@@ -1244,14 +1363,20 @@ ipcMain.handle('connect-rdp', (_e, payload) => {
   const ip = typeof payload === 'string' ? payload : (payload && payload.ip);
   const hostname = typeof payload === 'object' && payload ? payload.hostname : '';
   if (!ip) return { ok: false, error: '无效 IP' };
-  ensureRdpDynamicResolution();
   let target = ip;
   const domain = toEriiDomain(hostname);
   if (domain && syncHostsEntries([{ ip, hostname }])) {
     target = domain;
   }
+  const msrdcExe = findMsrdcExe();
+  if (msrdcExe) {
+    const rdpFile = writeMsrdcRdpFile(target);
+    spawn(msrdcExe, [rdpFile], { detached: true, stdio: 'ignore' }).unref();
+    return { ok: true, target, client: 'msrdc' };
+  }
+  ensureRdpDynamicResolution();
   spawn('mstsc.exe', [`/v:${target}`], { detached: true, stdio: 'ignore' }).unref();
-  return { ok: true, target };
+  return { ok: true, target, client: 'mstsc' };
 });
 
 ipcMain.handle('connect-moonlight', (_e, ip) => {
