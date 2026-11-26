@@ -30,7 +30,9 @@ $tmpExtract = Join-Path $env:TEMP "easytier-extract-$(Get-Random)"
 Write-Host "Downloading $assetName ($tagName)..." -ForegroundColor Yellow
 Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpZip -UseBasicParsing
 
-Expand-Archive -Path $tmpZip -DestinationPath $tmpExtract -Force
+New-Item -ItemType Directory -Force -Path $tmpExtract | Out-Null
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[System.IO.Compression.ZipFile]::ExtractToDirectory($tmpZip, $tmpExtract)
 foreach ($file in @("easytier-core.exe", "easytier-cli.exe", "wintun.dll", "Packet.dll", "WinDivert64.sys")) {
     $found = Get-ChildItem -Path $tmpExtract -Recurse -Filter $file | Select-Object -First 1
     if ($found) {
