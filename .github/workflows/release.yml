@@ -26,6 +26,8 @@ jobs:
 
       - name: Download latest EasyTier binaries
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm run download-easytier
 
       - name: Build NSIS installer
@@ -37,10 +39,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: EriiRemote-Windows-Installer
-          path: dist/*.exe
+          path: dist/*Setup*.exe
 
       - name: Create GitHub Release (on tag)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.exe
+          files: dist/*Setup*.exe
