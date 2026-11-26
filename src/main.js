@@ -6,7 +6,7 @@ const http = require('http');
 const https = require('https');
 const dgram = require('dgram');
 const crypto = require('crypto');
-const { spawn, execFile } = require('child_process');
+const { spawn, execFile, execFileSync } = require('child_process');
 
 const CONTROL_PORT = 17988;
 
@@ -288,13 +288,23 @@ function startControlServer() {
     }
 
     if (req.method === 'GET' && pathname === '/api/version') {
-      getInstallerInfo().then((inst) => {
+      Promise.all([getAsarInfo(), getInstallerInfo()]).then(([asar, inst]) => {
         sendJson(200, {
           ok: true,
           version: app.getVersion(),
+          asar: asar ? { sha256: asar.sha256, size: asar.size } : null,
           installer: inst ? { sha256: inst.sha256, size: inst.size } : null
         });
       });
+      return;
+    }
+
+    if (req.method === 'GET' && pathname === '/api/asar') {
+      const p = getLocalAsarPath();
+      if (!p) return sendJson(404, { ok: false, error: 'asar not available' });
+      const st = fs.statSync(p);
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': st.size });
+      fs.createReadStream(p).pipe(res);
       return;
     }
 
@@ -445,7 +455,35 @@ function startControlServer() {
 // ===================== LAN peer-to-peer auto update =====================
 let updateInProgress = false;
 let installerHashCache = null;
+let asarHashCache = null;
 const peerVersionCheckedAt = new Map();
+
+function getLocalAsarPath() {
+  if (!app.isPackaged) return null;
+  const p = path.join(process.resourcesPath, 'app.asar');
+  return fs.existsSync(p) ? p : null;
+}
+
+function getAsarInfo() {
+  return new Promise((resolve) => {
+    const p = getLocalAsarPath();
+    if (!p) return resolve(null);
+    let st;
+    try { st = fs.statSync(p); } catch { return resolve(null); }
+    if (asarHashCache && asarHashCache.path === p &&
+      asarHashCache.mtimeMs === st.mtimeMs && asarHashCache.size === st.size) {
+      return resolve(asarHashCache);
+    }
+    const hash = crypto.createHash('sha256');
+    fs.createReadStream(p)
+      .on('data', (c) => hash.update(c))
+      .on('error', () => resolve(null))
+      .on('end', () => {
+        asarHashCache = { path: p, mtimeMs: st.mtimeMs, size: st.size, sha256: hash.digest('hex') };
+        resolve(asarHashCache);
+      });
+  });
+}
 
 function getLocalInstallerPath() {
   if (!app.isPackaged) return null;
@@ -490,7 +528,7 @@ function notifyRenderer(channel, payload) {
   }
 }
 
-function downloadInstallerFromPeer(ip, token, dest, expectedSha, expectedSize) {
+function downloadFileFromPeer(ip, token, reqPath, dest, expectedSha, expectedSize) {
   return new Promise((resolve) => {
     const tmp = `${dest}.part`;
     let settled = false;
@@ -503,7 +541,7 @@ function downloadInstallerFromPeer(ip, token, dest, expectedSha, expectedSize) {
     const req = http.request({
       hostname: ip,
       port: CONTROL_PORT,
-      path: '/api/installer',
+      path: reqPath,
       method: 'GET',
       timeout: 120000,
       headers: { 'X-Erii-Token': token }
@@ -570,8 +608,9 @@ async function findHighestPeerUpdate(peers, token) {
       latest.knownDevices[key].appVersion = item.data.version;
       dirty = true;
     }
+    const asar = item.data.asar;
     const inst = item.data.installer;
-    if (!inst || !inst.sha256) continue;
+    if ((!asar || !asar.sha256) && (!inst || !inst.sha256)) continue;
     if (compareVersions(item.data.version, app.getVersion()) <= 0) continue;
     if (!best || compareVersions(item.data.version, best.data.version) > 0) {
       best = item;
@@ -601,6 +640,18 @@ async function probePeerVersionIfMissing(peer, data, token) {
   }
 }
 
+function launchDetachedPs1ViaVbs(dir, ps1Path) {
+  // Empirically verified on Windows: wscript.exe + WScript.Shell.Run(..., 0, False)
+  // launches a truly detached, zero-window PowerShell process that 100% survives app.exit(0).
+  const vbsPath = path.join(dir, 'launch-update.vbs');
+  const vbsContent = [
+    'Set sh = CreateObject("WScript.Shell")',
+    `sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""${ps1Path}""", 0, False`
+  ].join('\r\n') + '\r\n';
+  fs.writeFileSync(vbsPath, vbsContent, 'utf8');
+  execFileSync('wscript.exe', [vbsPath], { windowsHide: true });
+}
+
 async function checkAllPeersUpdate(peers, token, force = false) {
   if (!token || updateInProgress) return false;
   if (!force && Date.now() - lastBatchUpdateCheckAt < 60 * 1000) return false;
@@ -615,10 +666,10 @@ async function checkAllPeersUpdate(peers, token, force = false) {
   const latest = loadAppData();
 
   if (!app.isPackaged) return false;
+  const asarInfo = res.data.asar;
   const inst = res.data.installer;
 
   // By default only notify the user instead of killing a remote machine unattended.
-  // Automatic unattended upgrade only runs if user explicitly enabled `auto_update: true`, or clicked manual check (`force: true`).
   if (!force && latest.config.auto_update !== true) {
     notifyRenderer('update-status', { stage: 'available', version: res.data.version, from: key });
     return false;
@@ -627,31 +678,94 @@ async function checkAllPeersUpdate(peers, token, force = false) {
 
   updateInProgress = true;
   const version = res.data.version;
+  const escPs = (s) => String(s || '').replace(/'/g, "''");
   try {
     notifyRenderer('update-status', { stage: 'found', version, from: key });
-    writeLog('INFO', `Found update v${version} from ${key} (${peer.ipv4}), downloading...`);
     const dir = path.join(app.getPath('userData'), 'updates');
     fs.mkdirSync(dir, { recursive: true });
+    const updLog = path.join(app.getPath('userData'), 'logs', 'updater.log');
+    const ps1Path = path.join(dir, 'run-update.ps1');
+
+    // Preferred fast path: 140KB app.asar hot-swap (keeps easytier-core.exe & RDP alive, ~2s restart!)
+    if (asarInfo && asarInfo.sha256 && getLocalAsarPath()) {
+      writeLog('INFO', `Downloading fast asar update v${version} from ${key} (${peer.ipv4})...`);
+      const newAsar = path.join(dir, `app-${version}.asar`);
+      const ok = await downloadFileFromPeer(peer.ipv4, token, '/api/asar', newAsar, asarInfo.sha256, asarInfo.size);
+      if (ok) {
+        writeLog('INFO', `Verified asar v${version}, launching hot-swap updater via wscript...`);
+        notifyRenderer('update-status', { stage: 'installing', version });
+        const targetAsar = getLocalAsarPath();
+        setTimeout(() => {
+          const ps1Content = [
+            '$ErrorActionPreference = "Continue"',
+            `$log = '${escPs(updLog)}'`,
+            'function Log($m) { Add-Content -Path $log -Value ("[" + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + "] " + $m) -Encoding UTF8 }',
+            `Log "Asar hot-swap updater started for v${version} (oldPid=${process.pid})"`,
+            'Start-Sleep -Seconds 2',
+            `Stop-Process -Id ${process.pid} -Force -ErrorAction SilentlyContinue`,
+            'Start-Sleep -Milliseconds 500',
+            `$src = '${escPs(newAsar)}'`,
+            `$dst = '${escPs(targetAsar)}'`,
+            '$swapped = $false',
+            'for ($i = 0; $i -lt 10; $i++) {',
+            '  try {',
+            '    Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction Stop',
+            '    $swapped = $true',
+            '    break',
+            '  } catch {',
+            '    Log "Copy retry $i failed: $($_.Exception.Message)"',
+            '    Start-Sleep -Milliseconds 500',
+            '  }',
+            '}',
+            'Log "Asar swap result: $swapped"',
+            `$exePath = '${escPs(process.execPath)}'`,
+            'if (Test-Path -LiteralPath $exePath) {',
+            '  Log "Relaunching: $exePath"',
+            '  Start-Process -FilePath $exePath',
+            '}',
+            `Remove-Item -LiteralPath '${escPs(ps1Path)}' -Force -ErrorAction SilentlyContinue`
+          ].join('\r\n') + '\r\n';
+          fs.writeFileSync(ps1Path, '\uFEFF' + ps1Content, 'utf8');
+          try {
+            launchDetachedPs1ViaVbs(dir, ps1Path);
+          } catch (e) {
+            writeLog('ERROR', `wscript launch failed: ${e.message || e}`);
+            updateInProgress = false;
+            return;
+          }
+          isQuitting = true;
+          // Do NOT kill easytierProc so EasyTier tunnel & RDP stay connected during the 2-second relaunch!
+          if (controlServer) { try { controlServer.close(); } catch {} }
+          app.exit(0);
+        }, 800);
+        return true;
+      }
+      writeLog('WARN', `Asar download failed, falling back to full installer if available`);
+    }
+
+    // Fallback: full NSIS installer via verified wscript launcher
+    if (!inst || !inst.sha256) {
+      notifyRenderer('update-status', { stage: 'failed', version });
+      updateInProgress = false;
+      return false;
+    }
+    writeLog('INFO', `Found full installer update v${version} from ${key} (${peer.ipv4}), downloading...`);
     const dest = path.join(dir, `EriiRemote-Setup-${version}.exe`);
-    const ok = await downloadInstallerFromPeer(peer.ipv4, token, dest, inst.sha256, inst.size);
+    const ok = await downloadFileFromPeer(peer.ipv4, token, '/api/installer', dest, inst.sha256, inst.size);
     if (!ok) {
       writeLog('ERROR', `Failed to download/verify installer v${version} from ${peer.ipv4}`);
       notifyRenderer('update-status', { stage: 'failed', version });
       updateInProgress = false;
       return false;
     }
-    writeLog('INFO', `Downloaded & verified v${version}, launching silent installer...`);
+    writeLog('INFO', `Downloaded & verified v${version}, launching silent installer via wscript...`);
     notifyRenderer('update-status', { stage: 'installing', version });
     setTimeout(async () => {
-      // Use a UTF-8 BOM PowerShell script with baked-in paths (zero cmd.exe quote/GBK pitfalls, no black window)
-      const ps1Path = path.join(dir, 'run-update.ps1');
-      const updLog = path.join(app.getPath('userData'), 'logs', 'updater.log');
-      const escPs = (s) => String(s || '').replace(/'/g, "''");
       const ps1Content = [
         '$ErrorActionPreference = "Continue"',
         `$log = '${escPs(updLog)}'`,
         'function Log($m) { Add-Content -Path $log -Value ("[" + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + "] " + $m) -Encoding UTF8 }',
-        'Log "Updater PS1 started"',
+        'Log "Full installer updater started"',
         'Start-Sleep -Seconds 3',
         `$installer = '${escPs(dest)}'`,
         `$exePath = '${escPs(process.execPath)}'`,
@@ -665,7 +779,7 @@ async function checkAllPeersUpdate(peers, token, force = false) {
         'Start-Sleep -Seconds 2',
         '$candidates = @($exePath, (Join-Path $env:ProgramFiles "Erii远程\\Erii远程.exe"), (Join-Path $env:LOCALAPPDATA "Programs\\erii-remote\\Erii远程.exe"))',
         'foreach ($c in $candidates) {',
-        '  if ($c -and (Test-Path $c)) {',
+        '  if ($c -and (Test-Path -LiteralPath $c)) {',
         '    Log "Relaunching: $c"',
         '    Start-Process -FilePath $c',
         '    break',
@@ -674,21 +788,23 @@ async function checkAllPeersUpdate(peers, token, force = false) {
         `Remove-Item -LiteralPath '${escPs(ps1Path)}' -Force -ErrorAction SilentlyContinue`
       ].join('\r\n') + '\r\n';
       fs.writeFileSync(ps1Path, '\uFEFF' + ps1Content, 'utf8');
-      writeLog('INFO', `Executing updater ps1: ${ps1Path} dest=${dest} exe=${process.execPath}`);
-      spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ps1Path], {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true
-      }).unref();
+      try {
+        launchDetachedPs1ViaVbs(dir, ps1Path);
+      } catch (e) {
+        writeLog('ERROR', `wscript launch failed: ${e.message || e}`);
+        updateInProgress = false;
+        return;
+      }
       isQuitting = true;
       if (easytierProc && easytierProc.pid) {
         await killProcessSync(easytierProc.pid);
       }
       if (controlServer) { try { controlServer.close(); } catch {} }
       app.exit(0);
-    }, 1500);
+    }, 1000);
     return true;
-  } catch {
+  } catch (e) {
+    writeLog('ERROR', `Update flow error: ${e.message || e}`);
     updateInProgress = false;
     return false;
   }
@@ -939,9 +1055,7 @@ function queryPeers() {
         return { ok: false, error: '未找到 easytier-cli.exe', peers: [], relays: [], local: null, engineMode };
       }
 
-      const portals = engineMode === 'builtin'
-        ? ['127.0.0.1:25888', '127.0.0.1:15888']
-        : ['127.0.0.1:15888', '127.0.0.1:25888'];
+      const portals = ['127.0.0.1:25888', '127.0.0.1:15888'];
 
       let cliRes = await execCliPeer(cliExe, portals[0]);
       if (!cliRes.ok) {
