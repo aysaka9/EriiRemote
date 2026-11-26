@@ -1374,6 +1374,14 @@ async function ensureMsrdcInstalled() {
   }
 }
 
+function trustRdpLocalDevice(target) {
+  if (!target) return;
+  const key = 'HKCU\\Software\\Microsoft\\Terminal Server Client\\LocalDevices';
+  try {
+    execFileSync('reg', ['add', key, '/v', target, '/t', 'REG_DWORD', '/d', '255', '/f'], { windowsHide: true });
+  } catch {}
+}
+
 function writeMsrdcRdpFile(target) {
   const rdpDir = path.join(app.getPath('userData'), 'rdp');
   fs.mkdirSync(rdpDir, { recursive: true });
@@ -1387,6 +1395,12 @@ function writeMsrdcRdpFile(target) {
     'desktopwidth:i:1600',
     'desktopheight:i:900',
     'redirectclipboard:i:1',
+    'redirectprinters:i:0',
+    'redirectsmartcards:i:0',
+    'redirectwebauthn:i:0',
+    'redirectcomports:i:0',
+    'redirectposdevices:i:0',
+    'drivestoredirect:s:',
     'use multimon:i:0',
     'authentication level:i:2',
     'prompt for credentials on client:i:1'
@@ -1484,6 +1498,7 @@ ipcMain.handle('connect-rdp', (_e, payload) => {
   }
   const msrdcExe = findMsrdcExe();
   if (msrdcExe) {
+    trustRdpLocalDevice(target);
     const rdpFile = writeMsrdcRdpFile(target);
     spawn(msrdcExe, [rdpFile], { detached: true, stdio: 'ignore' }).unref();
     return { ok: true, target, client: 'msrdc' };
