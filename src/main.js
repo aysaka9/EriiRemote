@@ -1375,7 +1375,7 @@ async function ensureMsrdcInstalled() {
   }
 }
 
-let cachedRdpSignerSha256 = '';
+let cachedRdpSignerThumbprint = '';
 
 function getRdpSignerCachePath() {
   return path.join(app.getPath('userData'), 'rdp-signer.json');
@@ -1386,13 +1386,13 @@ function getRdpSignerCachePath() {
 function ensureRdpSigningCert() {
   return new Promise((resolve) => {
     const cachePath = getRdpSignerCachePath();
-    if (cachedRdpSignerSha256) return resolve(cachedRdpSignerSha256);
+    if (cachedRdpSignerThumbprint) return resolve(cachedRdpSignerThumbprint);
     if (fs.existsSync(cachePath)) {
       try {
         const cached = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
-        if (cached && cached.sha256) {
-          cachedRdpSignerSha256 = cached.sha256;
-          return resolve(cachedRdpSignerSha256);
+        if (cached && cached.sha1) {
+          cachedRdpSignerThumbprint = cached.sha1.toUpperCase();
+          return resolve(cachedRdpSignerThumbprint);
         }
       } catch {}
     }
@@ -1428,12 +1428,12 @@ function ensureRdpSigningCert() {
       }
       const m = String(stdout || '').match(/OK:([0-9A-F]{64}):([0-9A-F]{40})/i);
       if (m) {
-        cachedRdpSignerSha256 = m[1].toUpperCase();
+        cachedRdpSignerThumbprint = m[2].toUpperCase();
         try {
-          fs.writeFileSync(cachePath, JSON.stringify({ sha256: cachedRdpSignerSha256, sha1: m[2].toUpperCase() }), 'utf8');
+          fs.writeFileSync(cachePath, JSON.stringify({ sha256: m[1].toUpperCase(), sha1: cachedRdpSignerThumbprint }), 'utf8');
         } catch {}
-        writeLog('INFO', `RDP local signing cert ready (sha1=${m[2].toUpperCase()})`);
-        return resolve(cachedRdpSignerSha256);
+        writeLog('INFO', `RDP local signing cert ready (sha1=${cachedRdpSignerThumbprint})`);
+        return resolve(cachedRdpSignerThumbprint);
       }
       resolve('');
     });
@@ -1474,9 +1474,10 @@ function writeMsrdcRdpFile(target) {
   // Write standard UTF-16LE with BOM so rdpsign.exe signs cleanly
   const buf = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(content, 'utf16le')]);
   fs.writeFileSync(filePath, buf);
-  if (cachedRdpSignerSha256) {
+  if (cachedRdpSignerThumbprint) {
     try {
-      execFileSync('rdpsign.exe', ['/sha256', cachedRdpSignerSha256, '/q', filePath], { windowsHide: true, timeout: 5000 });
+      // Note: rdpsign.exe /sha256 expects the certificate's SHA-1 Thumbprint (not SHA-256 hash)
+      execFileSync('rdpsign.exe', ['/sha256', cachedRdpSignerThumbprint, '/q', filePath], { windowsHide: true, timeout: 5000 });
     } catch (e) {
       writeLog('WARN', `rdpsign failed: ${e.message || e}`);
     }
@@ -1574,7 +1575,7 @@ ipcMain.handle('connect-rdp', async (_e, payload) => {
   const msrdcExe = findMsrdcExe();
   if (msrdcExe) {
     trustRdpLocalDevice(target);
-    if (!cachedRdpSignerSha256) await ensureRdpSigningCert();
+    if (!cachedRdpSignerThumbprint) await ensureRdpSigningCert();
     const rdpFile = writeMsrdcRdpFile(target);
     spawn(msrdcExe, [rdpFile], { detached: true, stdio: 'ignore' }).unref();
     return { ok: true, target, client: 'msrdc' };
