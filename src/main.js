@@ -1221,6 +1221,7 @@ app.whenReady().then(async () => {
   startControlServer();
   ensureFirewallRule();
   ensureRdpWddmPolicy();
+  ensureRdpSigningCert().catch(() => {});
   ensureMsrdcInstalled().catch(() => {});
   await startEasyTierEngine(false);
   // Run peer discovery & auto-update check independently in main process every 60s
@@ -1374,6 +1375,71 @@ async function ensureMsrdcInstalled() {
   }
 }
 
+let cachedRdpSignerSha256 = '';
+
+function getRdpSignerCachePath() {
+  return path.join(app.getPath('userData'), 'rdp-signer.json');
+}
+
+// Create/trust a local self-signed code-signing cert once so rdpsign.exe can sign .rdp files
+// and suppress the "Unknown publisher / Remote Desktop Connection Security Warning" dialog.
+function ensureRdpSigningCert() {
+  return new Promise((resolve) => {
+    const cachePath = getRdpSignerCachePath();
+    if (cachedRdpSignerSha256) return resolve(cachedRdpSignerSha256);
+    if (fs.existsSync(cachePath)) {
+      try {
+        const cached = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+        if (cached && cached.sha256) {
+          cachedRdpSignerSha256 = cached.sha256;
+          return resolve(cachedRdpSignerSha256);
+        }
+      } catch {}
+    }
+
+    const psScript = [
+      '$ErrorActionPreference = "Stop"',
+      '$subj = "CN=EriiRemote Local RDP Signer"',
+      '$cert = Get-ChildItem Cert:\\CurrentUser\\My | Where-Object { $_.Subject -eq $subj -and $_.HasPrivateKey } | Select-Object -First 1',
+      'if (-not $cert) {',
+      '  $cert = New-SelfSignedCertificate -Subject $subj -Type CodeSigningCert -CertStoreLocation Cert:\\CurrentUser\\My -KeyExportPolicy Exportable -KeyLength 2048 -HashAlgorithm SHA256 -NotAfter (Get-Date).AddYears(10)',
+      '}',
+      '$tmpCer = Join-Path $env:TEMP ("erii-rdp-signer-" + $cert.Thumbprint + ".cer")',
+      'Export-Certificate -Cert $cert -FilePath $tmpCer -Force | Out-Null',
+      'Import-Certificate -FilePath $tmpCer -CertStoreLocation Cert:\\LocalMachine\\Root | Out-Null',
+      'Import-Certificate -FilePath $tmpCer -CertStoreLocation Cert:\\LocalMachine\\TrustedPublisher | Out-Null',
+      'Remove-Item -LiteralPath $tmpCer -Force -ErrorAction SilentlyContinue',
+      '$sha1 = $cert.Thumbprint.ToUpper()',
+      '$sha256 = ([BitConverter]::ToString($cert.GetCertHash("SHA256")) -replace "-", "").ToUpper()',
+      '$regPath = "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\Terminal Services"',
+      'if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }',
+      '$existing = (Get-ItemProperty -Path $regPath -Name "TrustedCertThumbprints" -ErrorAction SilentlyContinue).TrustedCertThumbprints',
+      '$list = @()',
+      'if ($existing) { $list = ($existing -split ",") | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ } }',
+      'if ($list -notcontains $sha1) { $list += $sha1 }',
+      'Set-ItemProperty -Path $regPath -Name "TrustedCertThumbprints" -Value ($list -join ",") -Type String',
+      'Write-Output ("OK:" + $sha256 + ":" + $sha1)'
+    ].join('; ');
+
+    execFile('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', psScript], { windowsHide: true, timeout: 25000 }, (err, stdout, stderr) => {
+      if (err) {
+        writeLog('WARN', `ensureRdpSigningCert failed: ${String(stderr || err.message).trim().slice(0, 200)}`);
+        return resolve('');
+      }
+      const m = String(stdout || '').match(/OK:([0-9A-F]{64}):([0-9A-F]{40})/i);
+      if (m) {
+        cachedRdpSignerSha256 = m[1].toUpperCase();
+        try {
+          fs.writeFileSync(cachePath, JSON.stringify({ sha256: cachedRdpSignerSha256, sha1: m[2].toUpperCase() }), 'utf8');
+        } catch {}
+        writeLog('INFO', `RDP local signing cert ready (sha1=${m[2].toUpperCase()})`);
+        return resolve(cachedRdpSignerSha256);
+      }
+      resolve('');
+    });
+  });
+}
+
 function trustRdpLocalDevice(target) {
   if (!target) return;
   const key = 'HKCU\\Software\\Microsoft\\Terminal Server Client\\LocalDevices';
@@ -1405,7 +1471,16 @@ function writeMsrdcRdpFile(target) {
     'authentication level:i:2',
     'prompt for credentials on client:i:1'
   ].join('\r\n') + '\r\n';
-  fs.writeFileSync(filePath, content, 'utf8');
+  // Write standard UTF-16LE with BOM so rdpsign.exe signs cleanly
+  const buf = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(content, 'utf16le')]);
+  fs.writeFileSync(filePath, buf);
+  if (cachedRdpSignerSha256) {
+    try {
+      execFileSync('rdpsign.exe', ['/sha256', cachedRdpSignerSha256, '/q', filePath], { windowsHide: true, timeout: 5000 });
+    } catch (e) {
+      writeLog('WARN', `rdpsign failed: ${e.message || e}`);
+    }
+  }
   return filePath;
 }
 
@@ -1487,7 +1562,7 @@ function syncHostsEntries(entries) {
   }
 }
 
-ipcMain.handle('connect-rdp', (_e, payload) => {
+ipcMain.handle('connect-rdp', async (_e, payload) => {
   const ip = typeof payload === 'string' ? payload : (payload && payload.ip);
   const hostname = typeof payload === 'object' && payload ? payload.hostname : '';
   if (!ip) return { ok: false, error: '无效 IP' };
@@ -1499,6 +1574,7 @@ ipcMain.handle('connect-rdp', (_e, payload) => {
   const msrdcExe = findMsrdcExe();
   if (msrdcExe) {
     trustRdpLocalDevice(target);
+    if (!cachedRdpSignerSha256) await ensureRdpSigningCert();
     const rdpFile = writeMsrdcRdpFile(target);
     spawn(msrdcExe, [rdpFile], { detached: true, stdio: 'ignore' }).unref();
     return { ok: true, target, client: 'msrdc' };
